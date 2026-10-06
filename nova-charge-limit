@@ -7,6 +7,7 @@ sys_root=${NOVA_CHARGE_LIMIT_SYS_ROOT:-/sys}
 config=${NOVA_CHARGE_LIMIT_CONFIG:-/etc/nova-charge-limit.conf}
 wait_seconds=${NOVA_CHARGE_LIMIT_WAIT:-60}
 retry_delay=${NOVA_CHARGE_LIMIT_RETRY_DELAY:-2}
+sudo_bin=${NOVA_CHARGE_LIMIT_SUDO:-sudo}
 
 # Ranges the qcom_battmgr driver accepts (it silently clamps anything else).
 limit_min=55 limit_max=100
@@ -28,13 +29,19 @@ Commands:
   set LIMIT [RESUME]  Save and apply a new limit ($limit_min-$limit_max%); charging
                       resumes below RESUME ($resume_min-$resume_max%, default LIMIT-$default_gap)
   off                 Charge to 100% again (same as: set 100)
+
+apply, set and off need root and ask for your password through sudo.
 EOF
 }
 
+# sudo can't find this command (its PATH is fixed to read-only system
+# folders), so elevate by absolute path instead.
 require_root() {
-    if ((EUID != 0)) && [[ ${NOVA_CHARGE_LIMIT_ALLOW_NONROOT:-0} != 1 ]]; then
-        die "run this command with sudo"
+    if ((EUID == 0)) || [[ ${NOVA_CHARGE_LIMIT_ALLOW_NONROOT:-0} == 1 ]]; then
+        return 0
     fi
+    command -v "$sudo_bin" >/dev/null || die "this command needs root; run it as root"
+    exec "$sudo_bin" -- "$(readlink -f -- "$0")" "$@"
 }
 
 is_percent() { [[ $1 =~ ^[0-9]{1,3}$ ]]; }
@@ -210,17 +217,17 @@ case ${1-} in
         ;;
     apply)
         (($# == 1)) || { usage >&2; exit 2; }
-        require_root
+        require_root "$@"
         cmd_apply
         ;;
     set)
         (($# == 2 || $# == 3)) || { usage >&2; exit 2; }
-        require_root
+        require_root "$@"
         cmd_set "${@:2}"
         ;;
     off)
         (($# == 1)) || { usage >&2; exit 2; }
-        require_root
+        require_root "$@"
         cmd_set "$limit_max"
         ;;
     -h | --help | help)

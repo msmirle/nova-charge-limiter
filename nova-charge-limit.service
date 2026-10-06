@@ -7,7 +7,8 @@ After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate
 [Service]
 # Not oneshot: waiting for the battery firmware must never hold up boot.
 Type=exec
-ExecStart=/usr/local/bin/nova-charge-limit apply
+# Runs through bash so the script needs no exec permission or label in /var.
+ExecStart=/usr/bin/bash /var/lib/nova-charge-limit/bin/nova-charge-limit apply
 
 [Install]
 WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target

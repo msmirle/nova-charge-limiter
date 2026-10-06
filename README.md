@@ -28,8 +28,11 @@ re-applies your limit:
   battery firmware has started), and
 - after waking from suspend, in case the firmware lost it.
 
-Everything is installed to `/etc` and `/usr/local`. Armada OS (bootc) keeps
-those across OS updates, so you don't need to rebuild the image.
+`/usr` (including `/usr/local`) is read-only on Armada OS, so the command
+is installed to `/var/lib/nova-charge-limit/bin` and put on your `PATH` by
+`/etc/profile.d/nova-charge-limit.sh`. The service, udev rule and settings
+go in `/etc`. Armada OS keeps both `/var` and `/etc` across OS updates, so
+you don't need to rebuild the image.
 
 ## Install
 
@@ -44,20 +47,25 @@ those across OS updates, so you don't need to rebuild the image.
    ```
 
 The installer refuses to run if the device has no charge-control setting.
-It applies the limit right away and prints the status.
+It applies the limit right away and prints the status. Open a new terminal
+afterwards so the `nova-charge-limit` command is found.
 
 ## Usage
 
 ```bash
-nova-charge-limit status          # current battery level and the active limit
-sudo nova-charge-limit set 80     # stop at 80%, resume below 75%
-sudo nova-charge-limit set 90 70  # stop at 90%, resume below 70%
-sudo nova-charge-limit off        # charge to 100% again
+nova-charge-limit status      # current battery level and the active limit
+nova-charge-limit set 80      # stop at 80%, resume below 75%
+nova-charge-limit set 90 70   # stop at 90%, resume below 70%
+nova-charge-limit off         # charge to 100% again
 ```
+
+`set`, `off` and `apply` ask for your password through `sudo` themselves.
+Don't type `sudo` in front: `sudo` only searches the read-only system
+folders, so it reports `command not found`.
 
 `set` and `off` save to `/etc/nova-charge-limit.conf`, so the setting
 survives reboots. You can also edit that file and run
-`sudo nova-charge-limit apply`.
+`nova-charge-limit apply`.
 
 Example `status` output:
 

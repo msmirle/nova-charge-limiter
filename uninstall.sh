@@ -3,12 +3,13 @@
 set -euo pipefail
 
 destdir=${DESTDIR:-}
-bin="$destdir/usr/local/bin/nova-charge-limit"
+bin_dir="$destdir/var/lib/nova-charge-limit"
+bin="$bin_dir/bin/nova-charge-limit"
 files=(
-    "$bin"
     "$destdir/etc/nova-charge-limit.conf"
     "$destdir/etc/systemd/system/nova-charge-limit.service"
     "$destdir/etc/udev/rules.d/90-nova-charge-limit.rules"
+    "$destdir/etc/profile.d/nova-charge-limit.sh"
 )
 
 if [[ -z $destdir ]]; then
@@ -21,6 +22,7 @@ if [[ -z $destdir ]]; then
 fi
 
 rm -f "${files[@]}"
+rm -rf "${bin_dir:?}"
 
 if [[ -z $destdir ]]; then
     systemctl daemon-reload

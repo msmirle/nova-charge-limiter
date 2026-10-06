@@ -52,6 +52,7 @@ run() {
         NOVA_CHARGE_LIMIT_WAIT=0 \
         NOVA_CHARGE_LIMIT_RETRY_DELAY=0 \
         NOVA_CHARGE_LIMIT_ALLOW_NONROOT=${allow_nonroot:-1} \
+        NOVA_CHARGE_LIMIT_SUDO=${test_sudo:-sudo} \
         "$tool" "$@" >"$work/out" 2>&1
 }
 
@@ -117,9 +118,19 @@ if ((EUID != 0)); then
 
     setup
     allow_nonroot=0
-    check "apply: requires root" fails run apply
-    check "apply: asks for sudo" output_has "run this command with sudo"
-    unset allow_nonroot
+    printf '#!/bin/sh\necho "SUDO $*"\n' >"$work/fake-sudo"
+    chmod +x "$work/fake-sudo"
+    test_sudo="$work/fake-sudo"
+    check "apply: hands off to sudo when not root" run apply
+    check "apply: sudo gets the absolute path" output_has "SUDO -- $(readlink -f "$tool") apply"
+    check "set: sudo gets all arguments" run set 85 70
+    check "set: sudo argument list" output_has "SUDO -- $(readlink -f "$tool") set 85 70"
+    check "apply: no thresholds written before elevating" thresholds 100 95
+    check "status: needs no root" run status
+    test_sudo=no-such-sudo
+    check "apply: fails without sudo" fails run apply
+    check "apply: explains it needs root" output_has "this command needs root"
+    unset allow_nonroot test_sudo
 fi
 
 # --- set / off -----------------------------------------------------------
@@ -195,9 +206,14 @@ check "usage: --help succeeds" run --help
 stage="$work/stage"
 staged() { DESTDIR="$stage" bash "$repo/$1" "${@:2}" >/dev/null 2>&1; }
 check "install: stages into DESTDIR" staged install.sh
-check "install: binary is executable" test -x "$stage/usr/local/bin/nova-charge-limit"
+check "install: nothing under read-only /usr" test ! -e "$stage/usr"
+check "install: binary is executable" test -x "$stage/var/lib/nova-charge-limit/bin/nova-charge-limit"
 check "install: unit installed" cmp -s "$repo/nova-charge-limit.service" "$stage/etc/systemd/system/nova-charge-limit.service"
+check "install: unit runs the installed binary" grep -q '^ExecStart=/usr/bin/bash /var/lib/nova-charge-limit/bin/nova-charge-limit apply$' "$stage/etc/systemd/system/nova-charge-limit.service"
 check "install: udev rule installed" cmp -s "$repo/90-nova-charge-limit.rules" "$stage/etc/udev/rules.d/90-nova-charge-limit.rules"
+check "install: PATH snippet installed" cmp -s "$repo/nova-charge-limit-path.sh" "$stage/etc/profile.d/nova-charge-limit.sh"
+# shellcheck disable=SC1091
+check "install: PATH snippet adds the bin dir once" test "$(PATH=/usr/bin; . "$stage/etc/profile.d/nova-charge-limit.sh"; . "$stage/etc/profile.d/nova-charge-limit.sh"; echo "$PATH")" = /usr/bin:/var/lib/nova-charge-limit/bin
 check "install: config installed" cmp -s "$repo/nova-charge-limit.conf" "$stage/etc/nova-charge-limit.conf"
 echo 'CHARGE_LIMIT=90' >"$stage/etc/nova-charge-limit.conf"
 staged install.sh
@@ -206,6 +222,7 @@ check "install: --resume needs --limit" fails staged install.sh --resume 70
 check "install: rejects unknown options" exits 2 staged install.sh --bogus
 check "uninstall: removes staged files" staged uninstall.sh
 check "uninstall: nothing left" test -z "$(find "$stage" -type f)"
+check "uninstall: removes the bin dir" test ! -e "$stage/var/lib/nova-charge-limit"
 
 echo
 if ((failures)); then

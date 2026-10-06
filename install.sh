@@ -1,6 +1,6 @@
 #!/usr/bin/bash
-# Installs nova-charge-limit. Everything lands in /etc and /usr/local, which
-# Armada OS (bootc) keeps across OS updates.
+# Installs nova-charge-limit. /usr is read-only on Armada OS (bootc), so the
+# command goes in /var and the rest in /etc; both survive OS updates.
 set -euo pipefail
 
 src=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -40,14 +40,17 @@ if [[ -z $destdir ]]; then
     fi
 fi
 
-bin="$destdir/usr/local/bin/nova-charge-limit"
+bin_dir="$destdir/var/lib/nova-charge-limit/bin"
+bin="$bin_dir/nova-charge-limit"
 conf="$destdir/etc/nova-charge-limit.conf"
 unit="$destdir/etc/systemd/system/nova-charge-limit.service"
 rules="$destdir/etc/udev/rules.d/90-nova-charge-limit.rules"
+profile="$destdir/etc/profile.d/nova-charge-limit.sh"
 
 install -Dm755 "$src/nova-charge-limit" "$bin"
 install -Dm644 "$src/nova-charge-limit.service" "$unit"
 install -Dm644 "$src/90-nova-charge-limit.rules" "$rules"
+install -Dm644 "$src/nova-charge-limit-path.sh" "$profile"
 if [[ -e $conf ]]; then
     echo "Keeping existing $conf"
 else
@@ -61,7 +64,7 @@ fi
 
 # Files copied in from a user's home can carry the wrong SELinux label.
 if command -v restorecon >/dev/null; then
-    restorecon -F "$bin" "$conf" "$unit" "$rules" || true
+    restorecon -RF "$bin_dir" "$conf" "$unit" "$rules" "$profile" || true
 fi
 systemctl daemon-reload
 systemctl enable nova-charge-limit.service
@@ -74,3 +77,5 @@ else
 fi
 echo
 "$bin" status
+echo
+echo "Open a new terminal to use the nova-charge-limit command."
