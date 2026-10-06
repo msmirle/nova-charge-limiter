@@ -2,14 +2,17 @@
 [Unit]
 Description=Battery charge limit (nova-charge-limit)
 ConditionPathExists=/etc/nova-charge-limit.conf
-# Re-apply after waking up in case the charger firmware lost the setting.
-After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
 
 [Service]
-# Not oneshot: waiting for the battery firmware must never hold up boot.
-Type=exec
+Type=simple
 # Runs through bash so the script needs no exec permission or label in /var.
-ExecStart=/usr/bin/bash /var/lib/nova-charge-limit/bin/nova-charge-limit apply
+ExecStart=/usr/bin/bash /var/lib/nova-charge-limit/bin/nova-charge-limit run
+RuntimeDirectory=nova-charge-limit
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=10
+# Exit status 3: this device has no working charge control.
+RestartPreventExitStatus=3
 
 [Install]
-WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+WantedBy=multi-user.target

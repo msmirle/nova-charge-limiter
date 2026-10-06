@@ -1,21 +1,34 @@
 #!/usr/bin/bash
 # SPDX-License-Identifier: GPL-2.0-or-later
-# Caps battery charging through the Qualcomm battery manager firmware
-# (qcom_battmgr), e.g. on the Retroid Pocket Nova running Armada OS.
+# Caps battery charging on Qualcomm handhelds running Armada OS, such as the
+# Retroid Pocket Nova. Where the charger firmware honours the charge
+# thresholds it enforces the limit itself. Where it ignores them (as on the
+# Nova), this pauses and resumes charging through the battery charge current
+# limit (constant_charge_current) as the battery level crosses the limit.
 set -uo pipefail
 
 sys_root=${NOVA_CHARGE_LIMIT_SYS_ROOT:-/sys}
 config=${NOVA_CHARGE_LIMIT_CONFIG:-/etc/nova-charge-limit.conf}
-wait_seconds=${NOVA_CHARGE_LIMIT_WAIT:-60}
+state_file=${NOVA_CHARGE_LIMIT_STATE:-/run/nova-charge-limit/state}
+interval=${NOVA_CHARGE_LIMIT_INTERVAL:-30}
 retry_delay=${NOVA_CHARGE_LIMIT_RETRY_DELAY:-2}
+service_wait=${NOVA_CHARGE_LIMIT_SERVICE_WAIT:-30}
+# Tests only: stop "run" after this many checks.
+max_ticks=${NOVA_CHARGE_LIMIT_MAX_TICKS:-0}
 sudo_bin=${NOVA_CHARGE_LIMIT_SUDO:-sudo}
+systemctl_bin=${NOVA_CHARGE_LIMIT_SYSTEMCTL:-systemctl}
+journalctl_bin=${NOVA_CHARGE_LIMIT_JOURNALCTL:-journalctl}
+service=nova-charge-limit.service
 
 # Ranges the qcom_battmgr driver accepts (it silently clamps anything else).
 limit_min=55 limit_max=100
 resume_min=50 resume_max=95
 default_gap=5
+# The service does not restart after this status: the device can't limit charging.
+exit_unsupported=3
 
 prog=${0##*/}
+battery='' method='' charging='' pause_capacity='' warned=0 sleep_pid=''
 
 log() { echo "$prog: $*" >&2; }
 die() { log "$*"; exit 1; }
@@ -25,13 +38,16 @@ usage() {
 Usage: $prog <command>
 
 Commands:
-  status              Show the battery state and the active charge limit
-  apply               Apply the limit saved in $config
+  status              Show the battery, the configured limit and how it is enforced
   set LIMIT [RESUME]  Save and apply a new limit ($limit_min-$limit_max%); charging
                       resumes below RESUME ($resume_min-$resume_max%, default LIMIT-$default_gap)
   off                 Charge to 100% again (same as: set 100)
+  apply               Re-apply the limit saved in $config
+  reset               Lift any limit right now, without changing the saved one
+  run                 Enforce the limit continuously (used by the service)
+  sleep               Prepare for system sleep (used by the sleep service)
 
-apply, set and off need root and ask for your password through sudo.
+All commands except status need root and ask for your password through sudo.
 EOF
 }
 
@@ -45,36 +61,30 @@ require_root() {
     exec "$sudo_bin" -- "$(readlink -f -- "$0")" "$@"
 }
 
+is_uint() { [[ $1 =~ ^[0-9]+$ ]]; }
+
 is_percent() { [[ $1 =~ ^[0-9]{1,3}$ ]]; }
 
 read_attr() { tr -d '\0\n' <"$1" 2>/dev/null; }
 
 write_attr() { printf '%s\n' "$2" 2>/dev/null >"$1"; }
 
+has_control() { [[ -e $1/charge_control_end_threshold || -e $1/constant_charge_current ]]; }
+
 find_battery() {
     local supply="$sys_root/class/power_supply/battery"
 
-    if [[ -e $supply/charge_control_end_threshold ]]; then
+    if has_control "$supply"; then
         printf '%s' "$supply"
         return 0
     fi
     for supply in "$sys_root"/class/power_supply/*; do
-        [[ -e $supply/charge_control_end_threshold && $(read_attr "$supply/type") == Battery ]] || continue
-        printf '%s' "$supply"
-        return 0
+        if [[ $(read_attr "$supply/type") == Battery ]] && has_control "$supply"; then
+            printf '%s' "$supply"
+            return 0
+        fi
     done
     return 1
-}
-
-# The battery only appears once the ADSP firmware is up, which can lag boot.
-wait_for_battery() {
-    local deadline=$((SECONDS + wait_seconds)) battery
-
-    until battery=$(find_battery); do
-        ((SECONDS < deadline)) || return 1
-        sleep 1
-    done
-    printf '%s' "$battery"
 }
 
 load_config() {
@@ -119,35 +129,12 @@ resolve_thresholds() {
         die "the resume point ($target_resume) must be below the limit ($target_limit)"
 }
 
-apply_thresholds() {
-    local battery=$1 limit=$2 resume=$3
-    local deadline=$((SECONDS + wait_seconds)) end='' start=''
-    local start_attr="$battery/charge_control_start_threshold"
-
-    while :; do
-        # Raising the end threshold keeps the old resume point, so the start
-        # write that follows is what pins the resume point.
-        if write_attr "$battery/charge_control_end_threshold" "$limit" &&
-            { [[ ! -e $start_attr ]] || write_attr "$start_attr" "$resume"; }; then
-            end=$(read_attr "$battery/charge_control_end_threshold")
-            start=$(read_attr "$start_attr")
-            if [[ $end == "$limit" ]] && { [[ ! -e $start_attr ]] || [[ $start == "$resume" ]]; }; then
-                log "charging stops at $limit% and resumes below ${start:-?}% (${battery})"
-                return 0
-            fi
-        fi
-        ((SECONDS < deadline)) || break
-        sleep "$retry_delay"
-    done
-    die "the charger did not accept limit $limit%/resume $resume% (reads back end=${end:-?} start=${start:-?})"
-}
-
 write_config() {
     local limit=$1 resume=$2 tmp
 
     tmp=$(mktemp "$config.XXXXXX" 2>/dev/null) || die "cannot write $config"
     if ! cat >"$tmp" <<EOF; then
-# nova-charge-limit settings. Change them with: sudo nova-charge-limit set LIMIT [RESUME]
+# nova-charge-limit settings. Change them with: nova-charge-limit set LIMIT [RESUME]
 
 # Charging stops once the battery reaches this percentage ($limit_min-$limit_max).
 CHARGE_LIMIT=$limit
@@ -165,50 +152,333 @@ EOF
     fi
 }
 
-cmd_apply() {
-    local battery
+# --- Charger firmware thresholds ---------------------------------------------
+
+thresholds_hold() {
+    local battery=$1 start_attr="$1/charge_control_start_threshold"
+
+    [[ -e $battery/charge_control_end_threshold ]] || return 1
+    [[ $(read_attr "$battery/charge_control_end_threshold") == "$2" ]] || return 1
+    [[ ! -e $start_attr || $(read_attr "$start_attr") == "$3" ]]
+}
+
+# Some firmware (the Nova's) accepts these writes but ignores them, and the
+# driver reports success either way; only a matching read-back counts.
+apply_thresholds() {
+    local battery=$1 limit=$2 resume=$3 attempt
+    local start_attr="$battery/charge_control_start_threshold"
+
+    [[ -e $battery/charge_control_end_threshold ]] || return 1
+    for attempt in 1 2 3; do
+        # Raising the end threshold keeps the old resume point, so the start
+        # write that follows is what pins the resume point.
+        write_attr "$battery/charge_control_end_threshold" "$limit"
+        [[ ! -e $start_attr ]] || write_attr "$start_attr" "$resume"
+        thresholds_hold "$battery" "$limit" "$resume" && return 0
+        ((attempt == 3)) || sleep "$retry_delay"
+    done
+    return 1
+}
+
+# --- Battery charge current limit (0 pauses charging, USB still powers the device)
+
+current_max() {
+    local max
+
+    max=$(read_attr "$1/constant_charge_current_max")
+    if ! is_uint "$max" || ((max == 0)); then
+        return 1
+    fi
+    printf '%s' "$max"
+}
+
+current_supported() { [[ -e $1/constant_charge_current ]] && current_max "$1" >/dev/null; }
+
+charging_paused() { [[ $(read_attr "$1/constant_charge_current") == 0 ]]; }
+
+pause_charging() { write_attr "$1/constant_charge_current" 0 && charging_paused "$1"; }
+
+allow_charging() {
+    local max
+
+    max=$(current_max "$1") || return 1
+    write_attr "$1/constant_charge_current" "$max" &&
+        [[ $(read_attr "$1/constant_charge_current") == "$max" ]]
+}
+
+# --- Service -----------------------------------------------------------------
+
+read_state() { sed -n "s/^$1=//p" "$state_file" 2>/dev/null | head -n 1; }
+
+write_state() {
+    local tmp="$state_file.$$"
+
+    if { printf 'pid=%s\n' "$$" && printf '%s\n' "$@"; } >"$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$state_file" 2>/dev/null && return 0
+    fi
+    rm -f "$tmp"
+}
+
+detect_method() {
+    if apply_thresholds "$battery" "$target_limit" "$target_resume"; then
+        method=firmware
+        log "the charger firmware enforces the limit: stops at $target_limit%, resumes below $target_resume%"
+        return 0
+    fi
+    if current_supported "$battery"; then
+        method=current
+        log "the charger firmware ignored the charge thresholds" \
+            "(reads back end=$(read_attr "$battery/charge_control_end_threshold" || echo '?'));" \
+            "pausing charging at $target_limit% and resuming below $target_resume% instead"
+        return 0
+    fi
+    log "this battery has no working charge control: the charger firmware ignored the" \
+        "charge thresholds and constant_charge_current is unavailable"
+    exit "$exit_unsupported"
+}
+
+check_firmware() {
+    thresholds_hold "$battery" "$target_limit" "$target_resume" && return 0
+    log "the charge thresholds were reset (e.g. by sleep); applying them again"
+    apply_thresholds "$battery" "$target_limit" "$target_resume" && return 0
+    if current_supported "$battery"; then
+        method=current
+        log "the charger firmware no longer accepts the charge thresholds; pausing charging instead"
+    else
+        log "could not restore the charge thresholds"
+    fi
+}
+
+check_current() {
+    local capacity=$1 want
+
+    if ! is_uint "$capacity"; then
+        log "cannot read the battery level"
+        return 0
+    fi
+    if ((target_limit >= limit_max)); then
+        want=allowed
+    elif ((capacity >= target_limit)); then
+        want=paused
+    elif ((capacity < target_resume)); then
+        want=allowed
+    elif charging_paused "$battery"; then
+        want=paused
+    else
+        want=allowed
+    fi
+
+    if [[ $want == paused ]]; then
+        if ! charging_paused "$battery"; then
+            if pause_charging "$battery"; then
+                log "battery at $capacity%: charging paused"
+                pause_capacity=$capacity warned=0
+            else
+                log "could not pause charging (constant_charge_current reads back" \
+                    "$(read_attr "$battery/constant_charge_current" || echo '?'))"
+            fi
+        fi
+        [[ -n $pause_capacity ]] || pause_capacity=$capacity
+        if ((!warned && capacity > pause_capacity + 1)); then
+            log "warning: the battery rose from $pause_capacity% to $capacity% while charging" \
+                "was paused; the charger firmware may ignore the charge current limit"
+            warned=1
+        fi
+    else
+        pause_capacity=''
+        if charging_paused "$battery"; then
+            if allow_charging "$battery"; then
+                log "battery at $capacity%: charging resumed"
+            else
+                log "could not resume charging"
+            fi
+        fi
+    fi
+}
+
+check() {
+    local capacity
+
+    capacity=$(read_attr "$battery/capacity")
+    [[ $method == firmware ]] && check_firmware
+    if [[ $method == current ]]; then
+        check_current "$capacity"
+        if charging_paused "$battery"; then charging=paused; else charging=allowed; fi
+    else
+        charging=firmware
+    fi
+    write_state "method=$method" "limit=$target_limit" "resume=$target_resume" \
+        "capacity=$capacity" "charging=$charging"
+}
+
+# Never leave charging paused once nothing is watching the battery.
+restore_charging() {
+    if [[ $method == current ]] && charging_paused "$battery"; then
+        allow_charging "$battery" && log "charging allowed again"
+    fi
+}
+
+on_signal() {
+    [[ -z $sleep_pid ]] || kill "$sleep_pid" 2>/dev/null
+    restore_charging
+    exit 0
+}
+
+cmd_run() {
+    local capacity ticks=0 waiting=0
 
     load_config
     resolve_thresholds "$cfg_limit" "$cfg_resume"
-    battery=$(wait_for_battery) ||
-        die "no battery with charge control appeared within ${wait_seconds}s"
-    apply_thresholds "$battery" "$target_limit" "$target_resume"
+    trap on_signal TERM INT
+
+    # The battery only reports once the charger firmware is up, which can lag boot.
+    while :; do
+        if battery=$(find_battery); then
+            capacity=$(read_attr "$battery/capacity")
+            is_uint "$capacity" && break
+        fi
+        ((waiting++)) || log "waiting for the battery"
+        sleep 2
+    done
+
+    detect_method
+    while :; do
+        check
+        if ((max_ticks && ++ticks >= max_ticks)); then
+            return 0
+        fi
+        sleep "$interval" &
+        sleep_pid=$!
+        wait "$sleep_pid"
+        sleep_pid=''
+    done
+}
+
+# Nothing watches the battery during sleep, so pause charging if it is already
+# past the resume point; otherwise it could charge past the limit unseen.
+cmd_sleep() {
+    local capacity
+
+    [[ $(read_state method) == current ]] || return 0
+    load_config
+    resolve_thresholds "$cfg_limit" "$cfg_resume"
+    ((target_limit < limit_max)) || return 0
+    battery=$(find_battery) || return 0
+    capacity=$(read_attr "$battery/capacity")
+    if ! is_uint "$capacity" || ((capacity < target_resume)) || charging_paused "$battery"; then
+        return 0
+    fi
+    pause_charging "$battery" && log "battery at $capacity%: charging paused for sleep"
+}
+
+cmd_reset() {
+    battery=$(find_battery) || die "this device has no battery charge control"
+    if [[ -e $battery/charge_control_end_threshold ]]; then
+        write_attr "$battery/charge_control_end_threshold" "$limit_max"
+        [[ ! -e $battery/charge_control_start_threshold ]] ||
+            write_attr "$battery/charge_control_start_threshold" "$resume_max"
+    fi
+    if current_supported "$battery" && charging_paused "$battery"; then
+        allow_charging "$battery" || die "could not resume charging"
+    fi
+    log "limit lifted; the battery charges to 100%"
+}
+
+service_installed() {
+    command -v "$systemctl_bin" >/dev/null && "$systemctl_bin" cat "$service" >/dev/null 2>&1
+}
+
+report() {
+    local limit resume capacity
+
+    limit=$(read_state limit) resume=$(read_state resume) capacity=$(read_state capacity)
+    if ((limit >= limit_max)); then
+        echo "No charge limit: the battery charges to 100%."
+    elif [[ $(read_state method) == firmware ]]; then
+        echo "Charging stops at $limit% and resumes below $resume%; the charger firmware enforces it."
+    else
+        echo "Charging pauses at $limit% and resumes below $resume%; the service watches the battery."
+        echo "Battery is at $capacity%: charging $(read_state charging)."
+    fi
+}
+
+# Restart the service with the saved settings and wait for its first check.
+activate() {
+    local pid deadline
+
+    service_installed || die "the $service service is not installed; run install.sh"
+    "$systemctl_bin" restart "$service" || die "could not restart $service"
+    deadline=$((SECONDS + service_wait))
+    while ((SECONDS < deadline)); do
+        pid=$("$systemctl_bin" show -p MainPID --value "$service" 2>/dev/null)
+        if [[ -n $pid && $pid != 0 && $(read_state pid) == "$pid" && -n $(read_state charging) ]]; then
+            report
+            return 0
+        fi
+        if ! "$systemctl_bin" is-active --quiet "$service"; then
+            log "the service could not apply the limit:"
+            "$journalctl_bin" -u "$service" -b -n 5 --no-pager -o cat >&2 2>/dev/null
+            exit 1
+        fi
+        sleep 1
+    done
+    die "the service did not report back within ${service_wait}s; see: journalctl -u $service"
+}
+
+cmd_apply() {
+    load_config
+    resolve_thresholds "$cfg_limit" "$cfg_resume"
+    activate
 }
 
 cmd_set() {
-    local resume=${2-} battery
+    local resume=${2-}
 
     resolve_thresholds "$1" "$resume"
-    battery=$(find_battery) ||
-        die "this device has no battery charge control (charge_control_end_threshold)"
+    find_battery >/dev/null || die "this device has no battery charge control"
     [[ -z $resume ]] || resume=$target_resume
     write_config "$target_limit" "$resume"
-    apply_thresholds "$battery" "$target_limit" "$target_resume"
+    activate
 }
 
 cmd_status() {
-    local battery model capacity state
+    local model capacity state pid end start current max
 
     model=$(read_attr "$sys_root/firmware/devicetree/base/model")
     echo "Device:      ${model:-unknown}"
 
     if [[ -r $config ]]; then
         (load_config && resolve_thresholds "$cfg_limit" "$cfg_resume" &&
-            echo "Configured:  stop at $target_limit%, resume below $target_resume% ($config)") ||
+            echo "Configured:  stop at $target_limit%, resume below $target_resume% ($config)") 2>/dev/null ||
             echo "Configured:  invalid ($config)"
     else
         echo "Configured:  none ($config is missing)"
     fi
 
     if ! battery=$(find_battery); then
-        echo "Battery:     no charge control found (charge_control_end_threshold)"
+        echo "Battery:     no charge control found"
         return 1
     fi
     capacity=$(read_attr "$battery/capacity")
     state=$(read_attr "$battery/status")
     echo "Battery:     ${capacity:-?}% (${state:-unknown}) at $battery"
-    echo "Active:      stop at $(read_attr "$battery/charge_control_end_threshold")%," \
-        "resume below $(read_attr "$battery/charge_control_start_threshold" || echo '?')%"
+
+    pid=$(read_state pid)
+    if [[ -n $pid && -d /proc/$pid ]]; then
+        case $(read_state method) in
+            firmware) echo "Service:     running; the charger firmware enforces the limit" ;;
+            current) echo "Service:     running; pauses charging at the limit (firmware ignores charge thresholds)"
+                echo "Charging:    $(read_state charging)" ;;
+            *) echo "Service:     starting" ;;
+        esac
+    else
+        echo "Service:     not running (start it with: nova-charge-limit apply)"
+    fi
+
+    end=$(read_attr "$battery/charge_control_end_threshold") start=$(read_attr "$battery/charge_control_start_threshold")
+    current=$(read_attr "$battery/constant_charge_current") max=$(read_attr "$battery/constant_charge_current_max")
+    echo "Raw:         end_threshold=${end:-n/a} start_threshold=${start:-n/a}" \
+        "charge_current=${current:-n/a} charge_current_max=${max:-n/a}"
 }
 
 case ${1-} in
@@ -216,20 +486,21 @@ case ${1-} in
         (($# == 1)) || { usage >&2; exit 2; }
         cmd_status
         ;;
-    apply)
+    run | sleep | reset | apply | off)
         (($# == 1)) || { usage >&2; exit 2; }
         require_root "$@"
-        cmd_apply
+        case $1 in
+            run) cmd_run ;;
+            sleep) cmd_sleep ;;
+            reset) cmd_reset ;;
+            apply) cmd_apply ;;
+            off) cmd_set "$limit_max" ;;
+        esac
         ;;
     set)
         (($# == 2 || $# == 3)) || { usage >&2; exit 2; }
         require_root "$@"
         cmd_set "${@:2}"
-        ;;
-    off)
-        (($# == 1)) || { usage >&2; exit 2; }
-        require_root "$@"
-        cmd_set "$limit_max"
         ;;
     -h | --help | help)
         usage
