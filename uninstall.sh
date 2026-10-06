@@ -1,4 +1,5 @@
 #!/usr/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Removes nova-charge-limit and lets the battery charge to 100% again.
 set -euo pipefail
 

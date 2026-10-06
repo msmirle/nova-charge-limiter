@@ -1,4 +1,5 @@
 #!/usr/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Installs nova-charge-limit. /usr is read-only on Armada OS (bootc), so the
 # command goes in /var and the rest in /etc; both survive OS updates.
 set -euo pipefail

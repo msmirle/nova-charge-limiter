@@ -113,3 +113,7 @@ bash tests/nova-charge-limit-test.sh   # runs against a fake sysfs, no device ne
 
 Keep line endings LF (`.gitattributes` enforces this); CRLF breaks the
 scripts on the device.
+
+## License
+
+GPL-2.0-or-later, the same as Armada OS. See [LICENSE](LICENSE).

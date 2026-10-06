@@ -1,4 +1,5 @@
 #!/usr/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Caps battery charging through the Qualcomm battery manager firmware
 # (qcom_battmgr), e.g. on the Retroid Pocket Nova running Armada OS.
 set -uo pipefail

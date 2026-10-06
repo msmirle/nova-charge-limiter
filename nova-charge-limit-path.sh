@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Puts nova-charge-limit on PATH; /usr/local is read-only on Armada OS.
 case ":${PATH}:" in
     *:/var/lib/nova-charge-limit/bin:*) ;;

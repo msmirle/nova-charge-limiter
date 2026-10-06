@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 [Unit]
 Description=Battery charge limit (nova-charge-limit)
 ConditionPathExists=/etc/nova-charge-limit.conf
