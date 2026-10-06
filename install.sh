@@ -48,14 +48,24 @@ unit="$destdir/etc/systemd/system/nova-charge-limit.service"
 rules="$destdir/etc/udev/rules.d/90-nova-charge-limit.rules"
 profile="$destdir/etc/profile.d/nova-charge-limit.sh"
 
-install -Dm755 "$src/nova-charge-limit" "$bin"
-install -Dm644 "$src/nova-charge-limit.service" "$unit"
-install -Dm644 "$src/90-nova-charge-limit.rules" "$rules"
-install -Dm644 "$src/nova-charge-limit-path.sh" "$profile"
+# Name the destinations up front so an error from an outdated copy of this
+# installer (which wrote to /usr/local) is easy to tell apart.
+echo "Installing nova-charge-limit to ${bin_dir#"$destdir"} and /etc"
+
+put() {
+    install -Dm"$1" "$2" "$3" && return 0
+    echo "install.sh: cannot write $3; check that ${3%/*} is writable (mount | grep -E ' /(var|etc) ')" >&2
+    exit 1
+}
+
+put 755 "$src/nova-charge-limit" "$bin"
+put 644 "$src/nova-charge-limit.service" "$unit"
+put 644 "$src/90-nova-charge-limit.rules" "$rules"
+put 644 "$src/nova-charge-limit-path.sh" "$profile"
 if [[ -e $conf ]]; then
     echo "Keeping existing $conf"
 else
-    install -Dm644 "$src/nova-charge-limit.conf" "$conf"
+    put 644 "$src/nova-charge-limit.conf" "$conf"
 fi
 
 if [[ -n $destdir ]]; then

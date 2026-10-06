@@ -46,7 +46,9 @@ you don't need to rebuild the image.
    sudo bash ./install.sh --limit 85 --resume 75
    ```
 
-The installer refuses to run if the device has no charge-control setting.
+The installer starts by printing
+`Installing nova-charge-limit to /var/lib/nova-charge-limit/bin and /etc`.
+It refuses to run if the device has no charge-control setting.
 It applies the limit right away and prints the status. Open a new terminal
 afterwards so the `nova-charge-limit` command is found.
 
@@ -77,6 +79,24 @@ Active:      stop at 80%, resume below 75%
 ```
 
 Logs: `journalctl -u nova-charge-limit`.
+
+## Troubleshooting
+
+**`install: cannot create regular file '/usr/local/bin/nova-charge-limit': Read-only file system`**
+
+You are running an old copy of the installer. `/usr/local` is read-only on
+Armada OS, and current versions don't use it. Get the latest copy and run it
+again:
+
+```bash
+cd nova-charge-limiter && git pull     # if you cloned it
+# or start fresh:
+rm -rf nova-charge-limiter
+git clone https://github.com/msmirle/nova-charge-limiter.git
+cd nova-charge-limiter && sudo bash ./install.sh
+```
+
+The current installer's first line of output names `/var/lib/nova-charge-limit/bin`.
 
 ## Uninstall
 

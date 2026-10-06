@@ -225,6 +225,19 @@ check "uninstall: removes staged files" staged uninstall.sh
 check "uninstall: nothing left" test -z "$(find "$stage" -type f)"
 check "uninstall: removes the bin dir" test ! -e "$stage/var/lib/nova-charge-limit"
 
+# shellcheck disable=SC2016 # expanded by the inner bash
+check "install: names the destinations" bash -c 'DESTDIR="$1" bash "$2/install.sh" | grep -qx "Installing nova-charge-limit to /var/lib/nova-charge-limit/bin and /etc"' _ "$stage" "$repo"
+staged uninstall.sh
+if ((EUID != 0)); then
+    stage="$work/stage-ro"
+    mkdir -p "$stage/etc"
+    chmod 555 "$stage/etc"
+    check "install: fails on an unwritable destination" fails staged install.sh
+    # shellcheck disable=SC2016 # expanded by the inner bash
+    check "install: names the unwritable path" bash -c 'DESTDIR="$1" bash "$2/install.sh" 2>&1 | grep -qF "cannot write $1/etc/systemd/system/nova-charge-limit.service"' _ "$stage" "$repo"
+    chmod 755 "$stage/etc"
+fi
+
 echo
 if ((failures)); then
     echo "$failures check(s) failed"
