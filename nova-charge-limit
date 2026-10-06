@@ -1,0 +1,233 @@
+#!/usr/bin/bash
+# Caps battery charging through the Qualcomm battery manager firmware
+# (qcom_battmgr), e.g. on the Retroid Pocket Nova running Armada OS.
+set -uo pipefail
+
+sys_root=${NOVA_CHARGE_LIMIT_SYS_ROOT:-/sys}
+config=${NOVA_CHARGE_LIMIT_CONFIG:-/etc/nova-charge-limit.conf}
+wait_seconds=${NOVA_CHARGE_LIMIT_WAIT:-60}
+retry_delay=${NOVA_CHARGE_LIMIT_RETRY_DELAY:-2}
+
+# Ranges the qcom_battmgr driver accepts (it silently clamps anything else).
+limit_min=55 limit_max=100
+resume_min=50 resume_max=95
+default_gap=5
+
+prog=${0##*/}
+
+log() { echo "$prog: $*" >&2; }
+die() { log "$*"; exit 1; }
+
+usage() {
+    cat <<EOF
+Usage: $prog <command>
+
+Commands:
+  status              Show the battery state and the active charge limit
+  apply               Apply the limit saved in $config
+  set LIMIT [RESUME]  Save and apply a new limit ($limit_min-$limit_max%); charging
+                      resumes below RESUME ($resume_min-$resume_max%, default LIMIT-$default_gap)
+  off                 Charge to 100% again (same as: set 100)
+EOF
+}
+
+require_root() {
+    if ((EUID != 0)) && [[ ${NOVA_CHARGE_LIMIT_ALLOW_NONROOT:-0} != 1 ]]; then
+        die "run this command with sudo"
+    fi
+}
+
+is_percent() { [[ $1 =~ ^[0-9]{1,3}$ ]]; }
+
+read_attr() { tr -d '\0\n' <"$1" 2>/dev/null; }
+
+write_attr() { printf '%s\n' "$2" 2>/dev/null >"$1"; }
+
+find_battery() {
+    local supply="$sys_root/class/power_supply/battery"
+
+    if [[ -e $supply/charge_control_end_threshold ]]; then
+        printf '%s' "$supply"
+        return 0
+    fi
+    for supply in "$sys_root"/class/power_supply/*; do
+        [[ -e $supply/charge_control_end_threshold && $(read_attr "$supply/type") == Battery ]] || continue
+        printf '%s' "$supply"
+        return 0
+    done
+    return 1
+}
+
+# The battery only appears once the ADSP firmware is up, which can lag boot.
+wait_for_battery() {
+    local deadline=$((SECONDS + wait_seconds)) battery
+
+    until battery=$(find_battery); do
+        ((SECONDS < deadline)) || return 1
+        sleep 1
+    done
+    printf '%s' "$battery"
+}
+
+load_config() {
+    local line key value
+    local re='^[[:space:]]*([A-Z_]+)[[:space:]]*=[[:space:]]*"?([^"[:space:]]*)"?[[:space:]]*$'
+
+    cfg_limit='' cfg_resume=''
+    [[ -r $config ]] || die "cannot read $config"
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line%$'\r'}
+        [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+        [[ $line =~ $re ]] || die "$config: cannot parse line: $line"
+        key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+        case $key in
+            CHARGE_LIMIT) cfg_limit=$value ;;
+            CHARGE_RESUME) cfg_resume=$value ;;
+            *) log "$config: ignoring unknown setting $key" ;;
+        esac
+    done <"$config"
+    [[ -n $cfg_limit ]] || die "$config: CHARGE_LIMIT is not set"
+}
+
+# Sets target_limit/target_resume, filling in the default resume point.
+resolve_thresholds() {
+    local limit=$1 resume=${2-}
+
+    if ! is_percent "$limit" || ((10#$limit < limit_min || 10#$limit > limit_max)); then
+        die "the limit must be $limit_min-$limit_max, got '$limit'"
+    fi
+    target_limit=$((10#$limit))
+
+    if [[ -z $resume ]]; then
+        target_resume=$((target_limit - default_gap))
+        ((target_resume >= resume_min)) || target_resume=$resume_min
+        return 0
+    fi
+    if ! is_percent "$resume" || ((10#$resume < resume_min || 10#$resume > resume_max)); then
+        die "the resume point must be $resume_min-$resume_max, got '$resume'"
+    fi
+    target_resume=$((10#$resume))
+    ((target_resume < target_limit)) ||
+        die "the resume point ($target_resume) must be below the limit ($target_limit)"
+}
+
+apply_thresholds() {
+    local battery=$1 limit=$2 resume=$3
+    local deadline=$((SECONDS + wait_seconds)) end='' start=''
+    local start_attr="$battery/charge_control_start_threshold"
+
+    while :; do
+        # Raising the end threshold keeps the old resume point, so the start
+        # write that follows is what pins the resume point.
+        if write_attr "$battery/charge_control_end_threshold" "$limit" &&
+            { [[ ! -e $start_attr ]] || write_attr "$start_attr" "$resume"; }; then
+            end=$(read_attr "$battery/charge_control_end_threshold")
+            start=$(read_attr "$start_attr")
+            if [[ $end == "$limit" ]] && { [[ ! -e $start_attr ]] || [[ $start == "$resume" ]]; }; then
+                log "charging stops at $limit% and resumes below ${start:-?}% (${battery})"
+                return 0
+            fi
+        fi
+        ((SECONDS < deadline)) || break
+        sleep "$retry_delay"
+    done
+    die "the charger did not accept limit $limit%/resume $resume% (reads back end=${end:-?} start=${start:-?})"
+}
+
+write_config() {
+    local limit=$1 resume=$2 tmp
+
+    tmp=$(mktemp "$config.XXXXXX" 2>/dev/null) || die "cannot write $config"
+    if ! cat >"$tmp" <<EOF; then
+# nova-charge-limit settings. Change them with: sudo nova-charge-limit set LIMIT [RESUME]
+
+# Charging stops once the battery reaches this percentage ($limit_min-$limit_max).
+CHARGE_LIMIT=$limit
+
+# Charging starts again once the battery drops below this percentage
+# ($resume_min-$resume_max). Leave empty to resume $default_gap% below CHARGE_LIMIT.
+CHARGE_RESUME=$resume
+EOF
+        rm -f "$tmp"
+        die "cannot write $config"
+    fi
+    if ! chmod 644 "$tmp" || ! mv -f "$tmp" "$config"; then
+        rm -f "$tmp"
+        die "cannot write $config"
+    fi
+}
+
+cmd_apply() {
+    local battery
+
+    load_config
+    resolve_thresholds "$cfg_limit" "$cfg_resume"
+    battery=$(wait_for_battery) ||
+        die "no battery with charge control appeared within ${wait_seconds}s"
+    apply_thresholds "$battery" "$target_limit" "$target_resume"
+}
+
+cmd_set() {
+    local resume=${2-} battery
+
+    resolve_thresholds "$1" "$resume"
+    battery=$(find_battery) ||
+        die "this device has no battery charge control (charge_control_end_threshold)"
+    [[ -z $resume ]] || resume=$target_resume
+    write_config "$target_limit" "$resume"
+    apply_thresholds "$battery" "$target_limit" "$target_resume"
+}
+
+cmd_status() {
+    local battery model capacity state
+
+    model=$(read_attr "$sys_root/firmware/devicetree/base/model")
+    echo "Device:      ${model:-unknown}"
+
+    if [[ -r $config ]]; then
+        (load_config && resolve_thresholds "$cfg_limit" "$cfg_resume" &&
+            echo "Configured:  stop at $target_limit%, resume below $target_resume% ($config)") ||
+            echo "Configured:  invalid ($config)"
+    else
+        echo "Configured:  none ($config is missing)"
+    fi
+
+    if ! battery=$(find_battery); then
+        echo "Battery:     no charge control found (charge_control_end_threshold)"
+        return 1
+    fi
+    capacity=$(read_attr "$battery/capacity")
+    state=$(read_attr "$battery/status")
+    echo "Battery:     ${capacity:-?}% (${state:-unknown}) at $battery"
+    echo "Active:      stop at $(read_attr "$battery/charge_control_end_threshold")%," \
+        "resume below $(read_attr "$battery/charge_control_start_threshold" || echo '?')%"
+}
+
+case ${1-} in
+    status)
+        (($# == 1)) || { usage >&2; exit 2; }
+        cmd_status
+        ;;
+    apply)
+        (($# == 1)) || { usage >&2; exit 2; }
+        require_root
+        cmd_apply
+        ;;
+    set)
+        (($# == 2 || $# == 3)) || { usage >&2; exit 2; }
+        require_root
+        cmd_set "${@:2}"
+        ;;
+    off)
+        (($# == 1)) || { usage >&2; exit 2; }
+        require_root
+        cmd_set "$limit_max"
+        ;;
+    -h | --help | help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

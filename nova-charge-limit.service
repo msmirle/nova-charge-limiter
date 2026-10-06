@@ -1,0 +1,13 @@
+[Unit]
+Description=Battery charge limit (nova-charge-limit)
+ConditionPathExists=/etc/nova-charge-limit.conf
+# Re-apply after waking up in case the charger firmware lost the setting.
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+# Not oneshot: waiting for the battery firmware must never hold up boot.
+Type=exec
+ExecStart=/usr/local/bin/nova-charge-limit apply
+
+[Install]
+WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
