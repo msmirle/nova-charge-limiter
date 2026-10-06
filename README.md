@@ -80,6 +80,14 @@ This sets the limit back to 100% and removes every installed file.
 
 ## Notes
 
+- **Reboots and updates:** the limit is re-applied at every boot, and the
+  install survives Armada OS updates.
+- **Sleep:** the charger firmware enforces the limit while asleep, and it is
+  re-applied on wake.
+- **Powered off:** most likely not enforced. With the device off, Linux isn't
+  running and the device's own charging firmware takes over, so it will
+  probably charge to 100%. To keep the limit, charge while the device is on
+  or asleep.
 - Steam may show the battery as *Not charging* at 80% while plugged in.
   That's expected.
 - The firmware has no true "off" switch. `off` sets the limit to 100% (resume
