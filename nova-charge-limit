@@ -22,7 +22,15 @@ journalctl_bin=${NOVA_CHARGE_LIMIT_JOURNALCTL:-journalctl}
 # instead (see nova-charge-limit-suspend.conf).
 armada_sleep_config=${NOVA_CHARGE_LIMIT_ARMADA_SLEEP_CONFIG:-/etc/armada/sleep.conf}
 sleep_config=${NOVA_CHARGE_LIMIT_SLEEP_CONFIG:-/run/nova-charge-limit-sleep.conf}
+# Armada's fake-suspend state; proc_root is only overridden by tests.
+armada_run=${NOVA_CHARGE_LIMIT_ARMADA_RUN:-/run/armada}
+proc_root=${NOVA_CHARGE_LIMIT_PROC_ROOT:-/proc}
+# After a power-button wake, how long fake suspend gets to wake up by itself.
+wake_settle=${NOVA_CHARGE_LIMIT_WAKE_SETTLE:-3}
+# Real sleeps shorter than this count toward giving up on deep sleep.
+short_sleep=${NOVA_CHARGE_LIMIT_SHORT_SLEEP:-30}
 service=nova-charge-limit.service
+sleep_marker='# nova-charge-limit: charging toward the limit'
 
 # Ranges the qcom_battmgr driver accepts (it silently clamps anything else).
 limit_min=55 limit_max=100
@@ -33,6 +41,8 @@ exit_unsupported=3
 
 prog=${0##*/}
 battery='' method='' charging='' pause_capacity='' warned=0 sleep_pid=''
+# Deep sleep bookkeeping for the current fake suspend.
+deep_blocked=0 deep_short=0 deep_failed=0 deep_announced=0
 
 log() { echo "$prog: $*" >&2; }
 die() { log "$*"; exit 1; }
@@ -46,6 +56,8 @@ Commands:
   set LIMIT [RESUME]  Save and apply a new limit ($limit_min-$limit_max%); charging
                       resumes below RESUME ($resume_min-$resume_max%, default LIMIT-$default_gap)
   off                 Charge to 100% again (same as: set 100)
+  deep-sleep on|off   Experimental: switch from fake suspend to real sleep once
+                      the battery reaches the limit while sleeping on the charger
   apply               Re-apply the limit saved in $config
   reset               Lift any limit right now, without changing the saved one
   run                 Enforce the limit continuously (used by the service)
@@ -105,7 +117,7 @@ load_config() {
     local line key value
     local re='^[[:space:]]*([A-Z_]+)[[:space:]]*=[[:space:]]*"?([^"[:space:]]*)"?[[:space:]]*$'
 
-    cfg_limit='' cfg_resume=''
+    cfg_limit='' cfg_resume='' cfg_deep=no
     [[ -r $config ]] || die "cannot read $config"
     while IFS= read -r line || [[ -n $line ]]; do
         line=${line%$'\r'}
@@ -115,10 +127,22 @@ load_config() {
         case $key in
             CHARGE_LIMIT) cfg_limit=$value ;;
             CHARGE_RESUME) cfg_resume=$value ;;
+            DEEP_SLEEP_AT_LIMIT)
+                case ${value,,} in
+                    yes | on | true | 1) cfg_deep=yes ;;
+                    no | off | false | 0 | '') cfg_deep=no ;;
+                    *) die "$config: DEEP_SLEEP_AT_LIMIT must be yes or no, got '$value'" ;;
+                esac
+                ;;
             *) log "$config: ignoring unknown setting $key" ;;
         esac
     done <"$config"
     [[ -n $cfg_limit ]] || die "$config: CHARGE_LIMIT is not set"
+}
+
+# The saved deep sleep setting, or "no" if the config is missing or invalid.
+saved_deep_sleep() {
+    (load_config >/dev/null 2>&1 && printf '%s' "$cfg_deep") || printf no
 }
 
 # Sets target_limit/target_resume, filling in the default resume point.
@@ -144,7 +168,7 @@ resolve_thresholds() {
 }
 
 write_config() {
-    local limit=$1 resume=$2 tmp
+    local limit=$1 resume=$2 deep=$3 tmp
 
     tmp=$(mktemp "$config.XXXXXX" 2>/dev/null) || die "cannot write $config"
     if ! cat >"$tmp" <<EOF; then
@@ -156,6 +180,11 @@ CHARGE_LIMIT=$limit
 # Charging starts again once the battery drops below this percentage
 # ($resume_min-$resume_max). Leave empty to resume $default_gap% below CHARGE_LIMIT.
 CHARGE_RESUME=$resume
+
+# Experimental (yes/no). While asleep on the charger, the Nova uses fake
+# suspend until the battery reaches CHARGE_LIMIT. "yes" then switches to real
+# sleep to save power. Change it with: nova-charge-limit deep-sleep on|off
+DEEP_SLEEP_AT_LIMIT=$deep
 EOF
         rm -f "$tmp"
         die "cannot write $config"
@@ -323,13 +352,126 @@ check() {
     capacity=$(read_attr "$battery/capacity")
     [[ $method == firmware ]] && check_firmware
     if [[ $method == current ]]; then
-        check_current "$capacity"
+        if deep_sleep_context && ! external_power_online; then
+            # A charger plugged in during real sleep must not charge past the limit.
+            if ! charging_paused "$battery" && pause_charging "$battery"; then
+                log "charger unplugged during sleep: charging paused"
+            fi
+        else
+            check_current "$capacity"
+        fi
         if charging_paused "$battery"; then charging=paused; else charging=allowed; fi
     else
         charging=firmware
     fi
     write_state "method=$method" "limit=$target_limit" "resume=$target_resume" \
         "capacity=$capacity" "charging=$charging"
+}
+
+# --- Deep sleep at the limit (experimental, DEEP_SLEEP_AT_LIMIT=yes) ----------
+#
+# While the Nova sleeps on the charger, it stays in Armada's fake suspend so
+# this service can stop charging at the limit. Once charging is paused, real
+# sleep is safe and saves power, so enter it from inside the fake suspend:
+# the screen, input and apps stay off, and the power button wakes the kernel
+# and then fake suspend as usual.
+
+fake_suspend_active() { [[ -e $armada_run/fake-suspend.active ]]; }
+
+# Only for a fake suspend that "nova-charge-limit sleep" chose, never for one
+# the user set up in /etc/armada/sleep.conf or that started some other way.
+fake_suspend_is_ours() {
+    local flag_time config_time
+
+    grep -qxF -- "$sleep_marker" "$sleep_config" 2>/dev/null || return 1
+    flag_time=$(stat -c %Y -- "$armada_run/fake-suspend.active" 2>/dev/null) || return 1
+    config_time=$(stat -c %Y -- "$sleep_config" 2>/dev/null) || return 1
+    ((flag_time >= config_time && flag_time - config_time <= 60))
+}
+
+deep_sleep_context() {
+    [[ $cfg_deep == yes && $method == current ]] || return 1
+    ((target_limit < limit_max)) || return 1
+    if ! fake_suspend_active; then
+        # A new fake suspend starts with a clean slate.
+        deep_blocked=0 deep_short=0 deep_failed=0 deep_announced=0
+        return 1
+    fi
+    ((!deep_blocked)) && fake_suspend_is_ours
+}
+
+deep_sleep_ready() {
+    deep_sleep_context || return 1
+    charging_paused "$battery" || return 1
+    grep -qw s2idle "$sys_root/power/mem_sleep" 2>/dev/null
+}
+
+# Prints "IRQ NAME" for what ended the last sleep, or "unknown".
+wake_reason() {
+    local irq name
+
+    irq=$(read_attr "$sys_root/power/pm_wakeup_irq")
+    if ! is_uint "$irq"; then
+        echo unknown
+        return 0
+    fi
+    name=$(awk -v irq="$irq:" '$1 == irq { print $NF; exit }' "$proc_root/interrupts" 2>/dev/null)
+    echo "$irq ${name:-unknown}"
+}
+
+# The power button (or anything unrecognised) means the user wants to wake up.
+user_wake() { [[ ${1,,} =~ (pwrkey|resin|power|key|lid|hall|unknown) ]]; }
+
+deep_sleep() {
+    local capacity started slept reason
+
+    capacity=$(read_attr "$battery/capacity")
+    ((deep_announced++)) ||
+        log "battery at $capacity% with charging paused: switching from fake suspend to real sleep"
+    if ! write_attr "$sys_root/power/mem_sleep" s2idle; then
+        log "cannot select s2idle sleep; staying in fake suspend"
+        deep_blocked=1
+        return 0
+    fi
+    started=$SECONDS
+    # Blocks until the system wakes up again.
+    if ! write_attr "$sys_root/power/state" mem; then
+        if ((++deep_failed >= 3)); then
+            log "could not enter real sleep 3 times; staying in fake suspend"
+            deep_blocked=1
+        else
+            log "could not enter real sleep; trying again"
+            sleep "$retry_delay"
+        fi
+        return 0
+    fi
+    deep_failed=0
+    slept=$((SECONDS - started))
+    reason=$(wake_reason)
+
+    if user_wake "$reason"; then
+        log "woke from real sleep after ${slept}s (wake: $reason); leaving it to fake suspend to wake up"
+        deep_blocked=1
+        sleep "$wake_settle"
+        # Fake suspend normally sees the same power button press. If it
+        # didn't, ask it to wake up so the screen doesn't stay off.
+        if fake_suspend_active && touch "$armada_run/fake-suspend.wake" 2>/dev/null; then
+            log "fake suspend was still active; asked it to wake up"
+        fi
+        return 0
+    fi
+
+    if ((slept < short_sleep)); then
+        if ((++deep_short >= 5)); then
+            log "woke from real sleep 5 times in a row within ${short_sleep}s (last wake: $reason);" \
+                "staying in fake suspend"
+            deep_blocked=1
+            return 0
+        fi
+    else
+        deep_short=0
+    fi
+    log "woke from real sleep after ${slept}s (wake: $reason); going back to sleep"
 }
 
 # Never leave charging paused once nothing is watching the battery.
@@ -368,6 +510,11 @@ cmd_run() {
         if ((max_ticks && ++ticks >= max_ticks)); then
             return 0
         fi
+        if deep_sleep_ready; then
+            deep_sleep
+            # Re-check straight away: the charger may have changed while asleep.
+            continue
+        fi
         sleep "$interval" &
         sleep_pid=$!
         wait "$sleep_pid"
@@ -383,7 +530,7 @@ write_sleep_config() {
     if {
         if [[ -r $armada_sleep_config ]]; then cat -- "$armada_sleep_config"; fi
         if [[ -n ${1-} ]]; then
-            printf '\n# nova-charge-limit: charging toward the limit\nsuspend_mode = %s\n' "$1"
+            printf '\n%s\nsuspend_mode = %s\n' "$sleep_marker" "$1"
         fi
     } >"$tmp" 2>/dev/null && mv -f "$tmp" "$sleep_config" 2>/dev/null; then
         return 0
@@ -412,7 +559,12 @@ cmd_sleep() {
 
     if external_power_online && ((capacity < target_resume)); then
         write_sleep_config fake
-        log "battery at $capacity% and charging: sleeping in fake suspend so charging stops at $target_limit%"
+        if [[ $cfg_deep == yes ]]; then
+            log "battery at $capacity% and charging: sleeping in fake suspend until charging stops at" \
+                "$target_limit%, then switching to real sleep"
+        else
+            log "battery at $capacity% and charging: sleeping in fake suspend so charging stops at $target_limit%"
+        fi
         return 0
     fi
     charging_paused "$battery" && return 0
@@ -485,8 +637,28 @@ cmd_set() {
     resolve_thresholds "$1" "$resume"
     find_battery >/dev/null || die "this device has no battery charge control"
     [[ -z $resume ]] || resume=$target_resume
-    write_config "$target_limit" "$resume"
+    write_config "$target_limit" "$resume" "$(saved_deep_sleep)"
     activate
+}
+
+cmd_deep_sleep() {
+    local deep
+
+    case $1 in
+        on) deep=yes ;;
+        off) deep=no ;;
+        *) usage >&2; exit 2 ;;
+    esac
+    load_config
+    resolve_thresholds "$cfg_limit" "$cfg_resume"
+    write_config "$cfg_limit" "$cfg_resume" "$deep"
+    activate
+    if [[ $deep == yes ]]; then
+        echo "Deep sleep at the limit: on (experimental). While asleep on the charger, the Nova"
+        echo "switches from fake suspend to real sleep once charging pauses at $target_limit%."
+    else
+        echo "Deep sleep at the limit: off. While asleep on the charger, the Nova stays in fake suspend."
+    fi
 }
 
 cmd_status() {
@@ -497,7 +669,8 @@ cmd_status() {
 
     if [[ -r $config ]]; then
         (load_config && resolve_thresholds "$cfg_limit" "$cfg_resume" &&
-            echo "Configured:  stop at $target_limit%, resume below $target_resume% ($config)") 2>/dev/null ||
+            echo "Configured:  stop at $target_limit%, resume below $target_resume% ($config)" &&
+            echo "Deep sleep:  $([[ $cfg_deep == yes ]] && echo "on (experimental)" || echo off)") 2>/dev/null ||
             echo "Configured:  invalid ($config)"
     else
         echo "Configured:  none ($config is missing)"
@@ -549,6 +722,11 @@ case ${1-} in
         (($# == 2 || $# == 3)) || { usage >&2; exit 2; }
         require_root "$@"
         cmd_set "${@:2}"
+        ;;
+    deep-sleep)
+        (($# == 2)) && [[ $2 == on || $2 == off ]] || { usage >&2; exit 2; }
+        require_root "$@"
+        cmd_deep_sleep "$2"
         ;;
     -h | --help | help)
         usage

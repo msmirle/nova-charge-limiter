@@ -51,6 +51,52 @@ for that one sleep. Your own sleep setting isn't changed.
 See [Why it doesn't work like the Steam Deck](#why-it-doesnt-work-like-the-steam-deck)
 for why fake suspend is needed and what the alternatives are.
 
+### Deep sleep at the limit (experimental, off by default)
+
+Fake suspend uses more power than real sleep, and it keeps doing so after
+the battery reaches the limit. With deep sleep at the limit turned on, the
+Nova switches to real sleep once charging pauses:
+
+```bash
+nova-charge-limit deep-sleep on    # turn it on
+nova-charge-limit deep-sleep off   # back to plain fake suspend
+```
+
+1. You put the Nova to sleep on the charger below 75%. It sleeps in fake
+   suspend and charges, as above.
+2. At 80% the service pauses charging. That pause holds through real sleep.
+3. The service then enters real sleep (`s2idle`) from inside the fake
+   suspend. The screen, input and your apps stay off.
+4. You press the power button. The Nova wakes from real sleep, and fake
+   suspend wakes the screen and apps as usual.
+
+After any other wake, the service decides what to do:
+
+| What woke the Nova | What happens |
+| --- | --- |
+| Power button, or anything the service can't identify | It never goes back to real sleep for this sleep. If fake suspend hasn't woken up after 3 seconds, the service asks it to (`/run/armada/fake-suspend.wake`), so the screen doesn't stay off. |
+| Anything else, e.g. the charger being plugged in or unplugged | It checks the battery. If charging is paused, or the charger was unplugged (charging is then paused), it goes back to real sleep. If the charger is plugged in and the battery is below 75%, charging resumes and it stays in fake suspend until 80%. |
+
+The wake reason comes from `/sys/power/pm_wakeup_irq` and
+`/proc/interrupts`. Anything named like `pwrkey`, `resin`, `power`, `key`,
+`lid` or `hall` counts as you waking it.
+
+Safety limits:
+
+- It only applies to a fake suspend that `nova-charge-limit` chose. If you
+  set `suspend_mode = fake` in `/etc/armada/sleep.conf` yourself, it leaves
+  that alone.
+- If the Nova wakes up 5 times in a row within 30 seconds of entering real
+  sleep, or real sleep fails 3 times, it gives up and stays in fake suspend
+  for the rest of that sleep.
+- The inner real sleep skips Armada's sleep hooks (wake logging, controller
+  lights, power-button handling). Fake suspend has already turned those off.
+
+It's experimental because it hasn't been tried on a Nova yet. If waking up
+ever takes more than one power-button press, or the screen stays off, turn
+it off with `nova-charge-limit deep-sleep off` and open an issue with the
+output of `journalctl -u nova-charge-limit -b`.
+
 ### Install locations
 
 `/usr` (including `/usr/local`) is read-only on Armada OS, so the command
@@ -112,6 +158,7 @@ during the sleep, the battery drains faster.
 | Approach | Exact limit in sleep? | Downsides |
 | --- | --- | --- |
 | **Fake suspend** (what this project does) | Yes | More power used while asleep on the charger. Unplugging during that sleep drains the battery faster. |
+| **Fake suspend, then real sleep at the limit** (this project, [opt-in](#deep-sleep-at-the-limit-experimental-off-by-default)) | Yes | Only uses fake suspend while charging. Experimental: relies on the power button wake being recognised. |
 | **Periodic wake-ups**: real sleep, with an RTC alarm waking the Nova every few minutes to check | Roughly; can overshoot by a few % between checks | Unverified that the Nova's RTC alarm can wake it from sleep. Each wake may briefly turn the screen and Steam back on. Not recommended. |
 | **Kernel change in Armada** | Yes, in real sleep | Closest to the Deck. Has to be accepted into Armada and shipped in an OS update. |
 
@@ -174,18 +221,20 @@ Your saved limit is kept.
 ## Usage
 
 ```bash
-nova-charge-limit status      # battery level, the limit, and how it is enforced
-nova-charge-limit set 80      # stop at 80%, resume below 75%
-nova-charge-limit set 90 70   # stop at 90%, resume below 70%
-nova-charge-limit off         # charge to 100% again
+nova-charge-limit status          # battery level, the limit, and how it is enforced
+nova-charge-limit set 80          # stop at 80%, resume below 75%
+nova-charge-limit set 90 70       # stop at 90%, resume below 70%
+nova-charge-limit off             # charge to 100% again
+nova-charge-limit deep-sleep on   # experimental: real sleep once the limit is reached
+nova-charge-limit deep-sleep off
 ```
 
 Every command except `status` asks for your password through `sudo` itself.
 Don't type `sudo` in front: `sudo` only searches the read-only system
 folders, so it reports `command not found`.
 
-`set` and `off` save to `/etc/nova-charge-limit.conf`, so the setting
-survives reboots. You can also edit that file and run
+`set`, `off` and `deep-sleep` save to `/etc/nova-charge-limit.conf`, so the
+settings survive reboots and updates. You can also edit that file and run
 `nova-charge-limit apply`.
 
 Example `status` output on the Nova:
@@ -193,6 +242,7 @@ Example `status` output on the Nova:
 ```text
 Device:      Retroid Pocket Nova
 Configured:  stop at 80%, resume below 75% (/etc/nova-charge-limit.conf)
+Deep sleep:  off
 Battery:     80% (Not charging) at /sys/class/power_supply/battery
 Service:     running; pauses charging at the limit (firmware ignores charge thresholds)
 Charging:    paused
@@ -200,7 +250,8 @@ Raw:         end_threshold=0 start_threshold=0 charge_current=0 charge_current_m
 ```
 
 Logs: `journalctl -u nova-charge-limit`. The service logs each pause and
-resume.
+resume, and with deep sleep on, each switch to real sleep and what woke the
+Nova.
 
 ## Notes
 
