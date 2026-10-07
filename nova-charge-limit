@@ -18,6 +18,10 @@ max_ticks=${NOVA_CHARGE_LIMIT_MAX_TICKS:-0}
 sudo_bin=${NOVA_CHARGE_LIMIT_SUDO:-sudo}
 systemctl_bin=${NOVA_CHARGE_LIMIT_SYSTEMCTL:-systemctl}
 journalctl_bin=${NOVA_CHARGE_LIMIT_JOURNALCTL:-journalctl}
+# The user's Armada sleep settings, and the copy suspend-dispatch reads
+# instead (see nova-charge-limit-suspend.conf).
+armada_sleep_config=${NOVA_CHARGE_LIMIT_ARMADA_SLEEP_CONFIG:-/etc/armada/sleep.conf}
+sleep_config=${NOVA_CHARGE_LIMIT_SLEEP_CONFIG:-/run/nova-charge-limit-sleep.conf}
 service=nova-charge-limit.service
 
 # Ranges the qcom_battmgr driver accepts (it silently clamps anything else).
@@ -45,7 +49,7 @@ Commands:
   apply               Re-apply the limit saved in $config
   reset               Lift any limit right now, without changing the saved one
   run                 Enforce the limit continuously (used by the service)
-  sleep               Prepare for system sleep (used by the sleep service)
+  sleep               Prepare for system sleep (run by systemd-suspend.service)
 
 All commands except status need root and ask for your password through sudo.
 EOF
@@ -70,6 +74,16 @@ read_attr() { tr -d '\0\n' <"$1" 2>/dev/null; }
 write_attr() { printf '%s\n' "$2" 2>/dev/null >"$1"; }
 
 has_control() { [[ -e $1/charge_control_end_threshold || -e $1/constant_charge_current ]]; }
+
+external_power_online() {
+    local supply
+
+    for supply in "$sys_root"/class/power_supply/*; do
+        [[ $(read_attr "$supply/type") == Battery ]] && continue
+        [[ $(read_attr "$supply/online") == 1 ]] && return 0
+    done
+    return 1
+}
 
 find_battery() {
     local supply="$sys_root/class/power_supply/battery"
@@ -209,6 +223,13 @@ allow_charging() {
 # --- Service -----------------------------------------------------------------
 
 read_state() { sed -n "s/^$1=//p" "$state_file" 2>/dev/null | head -n 1; }
+
+service_running() {
+    local pid
+
+    pid=$(read_state pid)
+    [[ -n $pid && -d /proc/$pid ]]
+}
 
 write_state() {
     local tmp="$state_file.$$"
@@ -354,20 +375,47 @@ cmd_run() {
     done
 }
 
-# Nothing watches the battery during sleep, so pause charging if it is already
-# past the resume point; otherwise it could charge past the limit unseen.
+# Armada's device-env takes the last suspend_mode line, so an appended one
+# overrides the user's setting for this sleep only.
+write_sleep_config() {
+    local tmp="$sleep_config.$$"
+
+    if {
+        if [[ -r $armada_sleep_config ]]; then cat -- "$armada_sleep_config"; fi
+        if [[ -n ${1-} ]]; then
+            printf '\n# nova-charge-limit: charging toward the limit\nsuspend_mode = %s\n' "$1"
+        fi
+    } >"$tmp" 2>/dev/null && mv -f "$tmp" "$sleep_config" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$tmp"
+    log "cannot write $sleep_config"
+}
+
+# Runs just before Armada suspends. Real suspend freezes the service, so
+# nothing could stop charging at the limit. While plugged in below the resume
+# point, sleep in Armada's fake suspend instead (screen and input off, the
+# service keeps running); otherwise pause charging before sleeping.
 cmd_sleep() {
     local capacity
 
-    [[ $(read_state method) == current ]] || return 0
+    write_sleep_config
+    if [[ $(read_state method) != current ]] || ! service_running; then
+        return 0
+    fi
     load_config
     resolve_thresholds "$cfg_limit" "$cfg_resume"
     ((target_limit < limit_max)) || return 0
     battery=$(find_battery) || return 0
     capacity=$(read_attr "$battery/capacity")
-    if ! is_uint "$capacity" || ((capacity < target_resume)) || charging_paused "$battery"; then
+    is_uint "$capacity" || return 0
+
+    if external_power_online && ((capacity < target_resume)); then
+        write_sleep_config fake
+        log "battery at $capacity% and charging: sleeping in fake suspend so charging stops at $target_limit%"
         return 0
     fi
+    charging_paused "$battery" && return 0
     pause_charging "$battery" && log "battery at $capacity%: charging paused for sleep"
 }
 

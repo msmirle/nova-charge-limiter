@@ -28,10 +28,30 @@ whichever one works on your device:
 If the service stops (shutdown, uninstall, `off`), it always turns charging
 back on, so the battery is never left unable to charge.
 
+### Sleep
+
+Real sleep (`s2idle`) freezes the service, so nothing could stop charging
+at the limit. Unlike the Steam Deck, whose embedded controller enforces the
+limit in hardware, the Nova has nothing that keeps enforcing it while
+asleep. So just before each sleep, `nova-charge-limit` picks the sleep mode:
+
+| When the Nova goes to sleep… | What happens |
+| --- | --- |
+| plugged in, battery below the resume point (75%) | It sleeps in Armada's **fake suspend**: screen, sound, lights, input and your apps are off or frozen, but the service keeps running. It charges to 80%, pauses, and stays there. |
+| plugged in, battery at 75% or more | Charging is paused, then it sleeps normally. |
+| unplugged | Charging is paused, then it sleeps normally. If you plug it in while it's asleep, it won't charge until you wake it. |
+
+On waking, the service resumes charging if the battery is below 75%.
+
+This uses a drop-in for Armada's `systemd-suspend.service`. Before each
+sleep, the drop-in has `suspend-dispatch` read a copy of your
+`/etc/armada/sleep.conf` (in `/run`), with `suspend_mode = fake` added only
+for that one sleep. Your own sleep setting isn't changed.
+
 `/usr` (including `/usr/local`) is read-only on Armada OS, so the command
 is installed to `/var/lib/nova-charge-limit/bin` and put on your `PATH` by
-`/etc/profile.d/nova-charge-limit.sh`. The services and settings go in
-`/etc`. Armada OS keeps both `/var` and `/etc` across OS updates, so you
+`/etc/profile.d/nova-charge-limit.sh`. The service, the suspend drop-in and
+the settings go in `/etc`. Armada OS keeps both `/var` and `/etc` across OS updates, so you
 don't need to rebuild the image.
 
 ## Install
@@ -92,11 +112,10 @@ resume.
 
 - **Reboots and updates:** the service starts at every boot, and the
   install survives Armada OS updates.
-- **Sleep:** the service can't watch the battery while the Nova sleeps.
-  Before sleep, if the battery is already at or above the resume point
-  (75%), charging is paused so it can't pass the limit. If it is below that,
-  charging continues during sleep and **may go past the limit**. The service
-  catches up within 30 seconds of waking.
+- **Sleep:** see [Sleep](#sleep). While in the charging fake suspend, the
+  Nova uses more power than in real sleep, but it comes from the charger. If
+  you unplug it during that sleep, wake it and put it back to sleep so it
+  goes into real sleep and drains less.
 - **Powered off:** most likely not enforced. With the device off, Linux isn't
   running and the device's own charging firmware takes over, so it will
   probably charge to 100%. To keep the limit, charge while the device is on.
@@ -143,7 +162,7 @@ sudo bash ./uninstall.sh
 ```
 
 This stops the service, turns charging back on, lifts the firmware
-thresholds, and removes every installed file.
+thresholds, and removes every installed file, including the suspend drop-in.
 
 ## Development
 

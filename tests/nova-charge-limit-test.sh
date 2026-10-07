@@ -68,6 +68,7 @@ setup() {
         "$work/etc" "$work/fake" "$bat"
     printf 'Retroid Pocket Nova\0' >"$work/sys/firmware/devicetree/base/model"
     echo USB >"$work/sys/class/power_supply/usb/type"
+    echo 1 >"$work/sys/class/power_supply/usb/online"
     echo Battery >"$bat/type"
     echo 64 >"$bat/capacity"
     echo Charging >"$bat/status"
@@ -102,6 +103,8 @@ run() {
         NOVA_CHARGE_LIMIT_MAX_TICKS=${max_ticks:-1} \
         NOVA_CHARGE_LIMIT_ALLOW_NONROOT=${allow_nonroot:-1} \
         NOVA_CHARGE_LIMIT_SUDO=${test_sudo:-sudo} \
+        NOVA_CHARGE_LIMIT_ARMADA_SLEEP_CONFIG="$work/etc/armada-sleep.conf" \
+        NOVA_CHARGE_LIMIT_SLEEP_CONFIG="$work/fake/sleep.conf" \
         "${runner[@]}" "$tool" "$@" >"$work/out" 2>&1
 }
 runner=()
@@ -118,6 +121,17 @@ thresholds() {
 
 current_is() { [[ $(<"$bat/constant_charge_current") == "$1" ]]; }
 capacity() { echo "$1" >"$bat/capacity"; }
+unplug() { echo 0 >"$work/sys/class/power_supply/usb/online"; }
+service_state() { printf 'pid=%s\nmethod=%s\n' "$$" "$1" >"$work/fake/state"; }
+# The suspend mode Armada's device-env would pick: the last suspend_mode line.
+sleep_mode() {
+    local mode=device-default line
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line =~ ^[[:space:]]*suspend_mode[[:space:]]*=[[:space:]]*(fake|s2idle)[[:space:]]*$ ]] &&
+            mode=${BASH_REMATCH[1]}
+    done <"$work/fake/sleep.conf"
+    [[ $mode == "$1" ]]
+}
 state_has() { grep -qx -- "$1" "$work/fake/state"; }
 config_has() { grep -qx -- "$1" "$work/etc/nova-charge-limit.conf"; }
 config_untouched() { cmp -s "$repo/nova-charge-limit.conf" "$work/etc/nova-charge-limit.conf"; }
@@ -334,29 +348,83 @@ check "apply: applies the saved limit" run apply
 check "apply: saved thresholds" thresholds 90 85
 
 # --- sleep / reset ---------------------------------------------------------
+# Your situation: plugged in at 69%, limit 80%.
 setup nova
-printf 'pid=1\nmethod=current\n' >"$work/fake/state"
-capacity 77
+service_state current
+capacity 69
 check "sleep: succeeds" run sleep
-check "sleep: pauses past the resume point" current_is 0
-check "sleep: logs the pause" output_has "charging paused for sleep"
+check "sleep: plugged in below the resume point uses fake suspend" sleep_mode fake
+check "sleep: keeps charging into fake suspend" current_is "$max_current"
+check "sleep: logs the fake suspend" output_has "battery at 69% and charging: sleeping in fake suspend so charging stops at 80%"
 
 setup nova
-printf 'pid=1\nmethod=current\n' >"$work/fake/state"
-capacity 70
-run sleep
-check "sleep: keeps charging below the resume point" current_is "$max_current"
-
-setup nova
-printf 'pid=1\nmethod=firmware\n' >"$work/fake/state"
+service_state current
 capacity 77
 run sleep
+check "sleep: plugged in past the resume point pauses" current_is 0
+check "sleep: ...and sleeps for real" sleep_mode device-default
+check "sleep: logs the pause" output_has "battery at 77%: charging paused for sleep"
+
+setup nova
+service_state current
+unplug
+capacity 50
+run sleep
+check "sleep: unplugged pauses so a charger plugged in during sleep can't pass the limit" current_is 0
+check "sleep: unplugged sleeps for real" sleep_mode device-default
+
+setup nova
+service_state current
+echo 'suspend_mode = s2idle' >"$work/etc/armada-sleep.conf"
+capacity 69
+run sleep
+check "sleep: fake suspend overrides the user's sleep.conf" sleep_mode fake
+check "sleep: keeps the user's sleep.conf lines" grep -qx 'suspend_mode = s2idle' "$work/fake/sleep.conf"
+
+setup nova
+service_state current
+printf 'suspend_mode = fake' >"$work/etc/armada-sleep.conf"
+capacity 77
+run sleep
+check "sleep: otherwise passes the user's sleep.conf through" sleep_mode fake
+check "sleep: copies it unchanged" cmp -s "$work/etc/armada-sleep.conf" "$work/fake/sleep.conf"
+
+setup nova
+service_state current
+capacity 77
+echo 0 >"$bat/constant_charge_current"
+run sleep
+check "sleep: already paused stays paused" current_is 0
+check "sleep: already paused sleeps for real" sleep_mode device-default
+
+setup nova
+service_state firmware
+capacity 69
+run sleep
+check "sleep: firmware limits need no fake suspend" sleep_mode device-default
 check "sleep: leaves firmware-enforced limits alone" current_is "$max_current"
 
 setup nova
-capacity 77
+printf 'pid=999999999\nmethod=current\n' >"$work/fake/state"
+capacity 69
 run sleep
 check "sleep: does nothing when the service is not running" current_is "$max_current"
+check "sleep: still writes the sleep config" sleep_mode device-default
+
+setup nova
+service_state current
+echo 'CHARGE_LIMIT=100' >"$work/etc/nova-charge-limit.conf"
+capacity 69
+run sleep
+check "sleep: no limit sleeps normally" sleep_mode device-default
+check "sleep: no limit keeps charging" current_is "$max_current"
+
+setup nova
+service_state current
+echo 'CHARGE_LIMIT=bad' >"$work/etc/nova-charge-limit.conf"
+printf 'suspend_mode = fake\n' >"$work/fake/sleep.conf"
+run sleep
+check "sleep: a bad config still replaces a stale sleep config" sleep_mode device-default
 
 setup firmware
 run run
@@ -419,15 +487,18 @@ unset allow_nonroot test_sudo
 # --- install / uninstall ----------------------------------------------------
 stage="$work/stage"
 staged() { DESTDIR="$stage" bash "$repo/$1" "${@:2}" >/dev/null 2>&1; }
-mkdir -p "$stage/etc/udev/rules.d"
-touch "$stage/etc/udev/rules.d/90-nova-charge-limit.rules"
+mkdir -p "$stage/etc/udev/rules.d" "$stage/etc/systemd/system"
+touch "$stage/etc/udev/rules.d/90-nova-charge-limit.rules" "$stage/etc/systemd/system/nova-charge-limit-sleep.service"
 check "install: stages into DESTDIR" staged install.sh
 check "install: nothing under read-only /usr" test ! -e "$stage/usr"
 check "install: binary is executable" test -x "$stage/var/lib/nova-charge-limit/bin/nova-charge-limit"
 check "install: unit installed" cmp -s "$repo/nova-charge-limit.service" "$stage/etc/systemd/system/nova-charge-limit.service"
-check "install: sleep unit installed" cmp -s "$repo/nova-charge-limit-sleep.service" "$stage/etc/systemd/system/nova-charge-limit-sleep.service"
+check "install: suspend drop-in installed" cmp -s "$repo/nova-charge-limit-suspend.conf" "$stage/etc/systemd/system/systemd-suspend.service.d/50-nova-charge-limit.conf"
 check "install: unit runs the installed binary" grep -q '^ExecStart=/usr/bin/bash /var/lib/nova-charge-limit/bin/nova-charge-limit run$' "$stage/etc/systemd/system/nova-charge-limit.service"
+check "install: drop-in runs the installed binary" grep -q '^ExecStartPre=-/usr/bin/bash /var/lib/nova-charge-limit/bin/nova-charge-limit sleep$' "$stage/etc/systemd/system/systemd-suspend.service.d/50-nova-charge-limit.conf"
+check "install: drop-in and tool agree on the sleep config path" grep -q "^Environment=ARMADA_SLEEP_CONFIG=$(sed -n 's/^sleep_config=.*:-\(.*\)}$/\1/p' "$tool")$" "$stage/etc/systemd/system/systemd-suspend.service.d/50-nova-charge-limit.conf"
 check "install: removes the 1.0.x udev rule" test ! -e "$stage/etc/udev/rules.d/90-nova-charge-limit.rules"
+check "install: removes the 1.1.0 sleep unit" test ! -e "$stage/etc/systemd/system/nova-charge-limit-sleep.service"
 check "install: PATH snippet installed" cmp -s "$repo/nova-charge-limit-path.sh" "$stage/etc/profile.d/nova-charge-limit.sh"
 # shellcheck disable=SC1091
 check "install: PATH snippet adds the bin dir once" test "$(PATH=/usr/bin; . "$stage/etc/profile.d/nova-charge-limit.sh"; . "$stage/etc/profile.d/nova-charge-limit.sh"; echo "$PATH")" = /usr/bin:/var/lib/nova-charge-limit/bin
@@ -440,6 +511,7 @@ check "install: rejects unknown options" exits 2 staged install.sh --bogus
 check "uninstall: removes staged files" staged uninstall.sh
 check "uninstall: nothing left" test -z "$(find "$stage" -type f)"
 check "uninstall: removes the bin dir" test ! -e "$stage/var/lib/nova-charge-limit"
+check "uninstall: removes the empty drop-in dir" test ! -e "$stage/etc/systemd/system/systemd-suspend.service.d"
 
 # shellcheck disable=SC2016 # expanded by the inner bash
 check "install: names the destinations" bash -c 'DESTDIR="$1" bash "$2/install.sh" | grep -qx "Installing nova-charge-limit to /var/lib/nova-charge-limit/bin and /etc"' _ "$stage" "$repo"

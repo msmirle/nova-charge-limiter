@@ -45,10 +45,11 @@ bin_dir="$destdir/var/lib/nova-charge-limit/bin"
 bin="$bin_dir/nova-charge-limit"
 conf="$destdir/etc/nova-charge-limit.conf"
 unit="$destdir/etc/systemd/system/nova-charge-limit.service"
-sleep_unit="$destdir/etc/systemd/system/nova-charge-limit-sleep.service"
+suspend_dropin="$destdir/etc/systemd/system/systemd-suspend.service.d/50-nova-charge-limit.conf"
 profile="$destdir/etc/profile.d/nova-charge-limit.sh"
-# Installed by 1.0.x; the service now waits for the battery itself.
+# Left by older versions: the 1.0.x udev rule and the 1.1.0 sleep unit.
 old_rules="$destdir/etc/udev/rules.d/90-nova-charge-limit.rules"
+old_sleep_unit="$destdir/etc/systemd/system/nova-charge-limit-sleep.service"
 
 # Name the destinations up front so an error from an outdated copy of this
 # installer (which wrote to /usr/local) is easy to tell apart.
@@ -67,9 +68,9 @@ fi
 
 put 755 "$src/nova-charge-limit" "$bin"
 put 644 "$src/nova-charge-limit.service" "$unit"
-put 644 "$src/nova-charge-limit-sleep.service" "$sleep_unit"
+put 644 "$src/nova-charge-limit-suspend.conf" "$suspend_dropin"
 put 644 "$src/nova-charge-limit-path.sh" "$profile"
-rm -f "$old_rules"
+rm -f "$old_rules" "$old_sleep_unit"
 if [[ -e $conf ]]; then
     echo "Keeping existing $conf"
 else
@@ -83,7 +84,7 @@ fi
 
 # Files copied in from a user's home can carry the wrong SELinux label.
 if command -v restorecon >/dev/null; then
-    restorecon -RF "$bin_dir" "$conf" "$unit" "$sleep_unit" "$profile" || true
+    restorecon -RF "$bin_dir" "$conf" "$unit" "${suspend_dropin%/*}" "$profile" || true
 fi
 systemctl daemon-reload
 systemctl enable nova-charge-limit.service nova-charge-limit-sleep.service

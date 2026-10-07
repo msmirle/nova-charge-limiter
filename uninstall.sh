@@ -9,9 +9,11 @@ bin="$bin_dir/bin/nova-charge-limit"
 files=(
     "$destdir/etc/nova-charge-limit.conf"
     "$destdir/etc/systemd/system/nova-charge-limit.service"
+    "$destdir/etc/systemd/system/systemd-suspend.service.d/50-nova-charge-limit.conf"
     "$destdir/etc/systemd/system/nova-charge-limit-sleep.service"
     "$destdir/etc/udev/rules.d/90-nova-charge-limit.rules"
     "$destdir/etc/profile.d/nova-charge-limit.sh"
+    "$destdir/run/nova-charge-limit-sleep.conf"
 )
 
 if [[ -z $destdir ]]; then
@@ -26,6 +28,8 @@ fi
 
 rm -f "${files[@]}"
 rm -rf "${bin_dir:?}"
+# Only if empty: other drop-ins may share it.
+rmdir "$destdir/etc/systemd/system/systemd-suspend.service.d" 2>/dev/null || true
 
 if [[ -z $destdir ]]; then
     systemctl daemon-reload
