@@ -31,9 +31,9 @@ back on, so the battery is never left unable to charge.
 ### Sleep
 
 Real sleep (`s2idle`) freezes the service, so nothing could stop charging
-at the limit. Unlike the Steam Deck, whose embedded controller enforces the
-limit in hardware, the Nova has nothing that keeps enforcing it while
-asleep. So just before each sleep, `nova-charge-limit` picks the sleep mode:
+at the limit. Unlike the Steam Deck, the Nova has nothing that keeps
+enforcing it while asleep. So just before each sleep, `nova-charge-limit`
+picks the sleep mode:
 
 | When the Nova goes to sleep… | What happens |
 | --- | --- |
@@ -48,11 +48,105 @@ sleep, the drop-in has `suspend-dispatch` read a copy of your
 `/etc/armada/sleep.conf` (in `/run`), with `suspend_mode = fake` added only
 for that one sleep. Your own sleep setting isn't changed.
 
+See [Why it doesn't work like the Steam Deck](#why-it-doesnt-work-like-the-steam-deck)
+for why fake suspend is needed and what the alternatives are.
+
+### Install locations
+
 `/usr` (including `/usr/local`) is read-only on Armada OS, so the command
 is installed to `/var/lib/nova-charge-limit/bin` and put on your `PATH` by
 `/etc/profile.d/nova-charge-limit.sh`. The service, the suspend drop-in and
-the settings go in `/etc`. Armada OS keeps both `/var` and `/etc` across OS updates, so you
-don't need to rebuild the image.
+the settings go in `/etc`. Armada OS keeps both `/var` and `/etc` across OS
+updates, so you don't need to rebuild the image.
+
+## Why it doesn't work like the Steam Deck
+
+On the Steam Deck, the charge limit holds whether the Deck is awake,
+asleep or powered off. On the Nova it needs fake suspend to hold during
+sleep, and it can't hold at all while the Nova is off. This section
+explains why, and what it would take to match the Deck.
+
+### How the Steam Deck does it
+
+SteamOS doesn't enforce the limit itself. It hands the limit to the Deck's
+**embedded controller** (EC), a small chip that runs the charger
+independently of the main processor. SteamOS writes it through the
+`jupiter` ACPI driver (`max_battery_charge_level`). Because the EC keeps
+running on its own, it stops charging at the limit while the Deck is
+awake, asleep or off. Most laptops' "battery conservation" modes work the
+same way.
+
+### What the Nova has instead
+
+The Nova's equivalent of the EC is the **charger firmware**. It runs on a
+separate Qualcomm processor (the ADSP) and is controlled by Linux's
+`qcom_battmgr` driver. That firmware offers two relevant controls:
+
+| Control | What it should do | Does it work on the Nova? |
+| --- | --- | --- |
+| `charge_control_end_threshold` / `charge_control_start_threshold` | Stop charging at X%, resume below Y% (EC-style) | **No.** The firmware accepts the values, but they read back as `0` and are ignored. With v1.1.0 the 80% limit was sent to the firmware, and the battery still charged from 69% to 96% while asleep. |
+| `constant_charge_current` (added by Armada's kernel patch `0903`) | Battery charge current; `0` stops charging while USB keeps powering the device | **Yes**, and the setting holds through sleep. |
+
+The working control is an **on/off switch**, not a "stop at 80%" setting.
+Something has to watch the battery level and flip the switch at the right
+moment. That's what the `nova-charge-limit` service does.
+
+### Why fake suspend is needed
+
+Real sleep (`s2idle`) freezes every program, including the service, so
+nothing can flip the switch at 80% while the Nova sleeps. The firmware
+keeps whichever state it was given before sleep:
+
+- **Charging on:** it charges past the limit (the 96% case).
+- **Charging off:** it doesn't charge at all until you wake it.
+
+Fake suspend is Armada's own lighter sleep mode. It turns the screen,
+sound, lights and input off and freezes your apps, but leaves system
+services running. Using it only while charging toward the limit keeps the
+limit exact. The cost is that the Nova uses more power during that sleep
+than in real sleep. The charger supplies that power, but if you unplug
+during the sleep, the battery drains faster.
+
+### The options
+
+| Approach | Exact limit in sleep? | Downsides |
+| --- | --- | --- |
+| **Fake suspend** (what this project does) | Yes | More power used while asleep on the charger. Unplugging during that sleep drains the battery faster. |
+| **Periodic wake-ups**: real sleep, with an RTC alarm waking the Nova every few minutes to check | Roughly; can overshoot by a few % between checks | Unverified that the Nova's RTC alarm can wake it from sleep. Each wake may briefly turn the screen and Steam back on. Not recommended. |
+| **Kernel change in Armada** | Yes, in real sleep | Closest to the Deck. Has to be accepted into Armada and shipped in an OS update. |
+
+### The kernel option in detail
+
+The closest match to the Deck would put the "stop at X%" logic in the
+kernel instead of in a program:
+
+- **How it would work:** the charger firmware already sends battery
+  updates (`NOTIF_BAT_STATUS` and similar) to `qcom_battmgr`, which reports
+  them with `power_supply_changed()`. The driver could check the battery
+  level on each update and set the charge current to `0` at the limit. The
+  kernel can handle that during real sleep without waking your apps.
+- **Precedent:** Armada already does something similar. Kernel patch
+  `0532` keeps the fan running while charging in sleep. It registers a
+  power-supply notifier (`power_supply_reg_notifier`) and reacts to charger
+  events during suspend-to-idle (`PM_SUSPEND_TO_IDLE`). `armada-powerd`
+  turns it on through `pwm1_sleep_charging`.
+- **Who it would help:** every Armada device that uses `qcom_battmgr`,
+  including the AYN Odin 2 and Thor and the Retroid Pocket 6 mentioned in
+  [armada-os/armada#363](https://github.com/armada-os/armada/issues/363).
+- **Caveats:** it can't be added from outside the OS image; it would need
+  a pull request to Armada and a new Armada release. It's also unverified
+  whether the Nova's charger firmware sends battery updates during sleep.
+  Patch `0532` has the same caveat: it only works with power-supply
+  drivers that keep reporting during suspend-to-idle.
+
+### Powered off
+
+None of these options can keep the limit while the Nova is fully powered
+off. Linux isn't running, so the device's own boot-time charging firmware
+takes over and will most likely charge toward 100%. The Deck manages it
+only because its EC enforces the limit independently. On the Nova, that
+would need the charger firmware to honour `charge_control_end_threshold`,
+and it doesn't.
 
 ## Install
 
@@ -118,7 +212,8 @@ resume.
   goes into real sleep and drains less.
 - **Powered off:** most likely not enforced. With the device off, Linux isn't
   running and the device's own charging firmware takes over, so it will
-  probably charge to 100%. To keep the limit, charge while the device is on.
+  probably charge to 100%. To keep the limit, charge while the device is on
+  or asleep. See [Powered off](#powered-off).
 - The battery can go up to 1% past the limit before the next check, because
   the service checks every 30 seconds.
 - Steam may show the battery as *Not charging* at the limit while plugged
