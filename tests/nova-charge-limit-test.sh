@@ -101,7 +101,7 @@ EOF
 
 run() {
     PATH="$work/bin:$PATH" \
-        FAKE_DIR="$work/fake" FAKE_TOOL="$tool" \
+        FAKE_DIR="$work/fake" FAKE_TOOL="${service_tool:-$tool}" \
         NOVA_CHARGE_LIMIT_SYS_ROOT="$work/sys" \
         NOVA_CHARGE_LIMIT_CONFIG="$work/etc/nova-charge-limit.conf" \
         NOVA_CHARGE_LIMIT_STATE="$work/fake/state" \
@@ -116,8 +116,11 @@ run() {
         NOVA_CHARGE_LIMIT_ARMADA_RUN="$work/fake/armada" \
         NOVA_CHARGE_LIMIT_PROC_ROOT="$work/proc" \
         NOVA_CHARGE_LIMIT_WAKE_SETTLE=0 \
+        NOVA_CHARGE_LIMIT_SETTLE=1 \
+        NOVA_CHARGE_LIMIT_SLEEP_SETTLE=1 \
+        NOVA_CHARGE_LIMIT_POLL_DELAY=0.05 \
         NOVA_CHARGE_LIMIT_SHORT_SLEEP=${short_sleep:-30} \
-        "${runner[@]}" "$tool" "$@" >"$work/out" 2>&1
+        "${runner[@]}" "$tool" "$@" >"${out_file:-$work/out}" 2>&1
 }
 runner=()
 
@@ -160,7 +163,7 @@ sleep_mode() {
     done <"$work/fake/sleep.conf"
     [[ $mode == "$1" ]]
 }
-state_has() { grep -qx -- "$1" "$work/fake/state"; }
+state_has() { grep -qx -- "$1" "$work/fake/state" 2>/dev/null; }
 config_has() { grep -qx -- "$1" "$work/etc/nova-charge-limit.conf"; }
 config_untouched() { cmp -s "$repo/nova-charge-limit.conf" "$work/etc/nova-charge-limit.conf"; }
 output_has() { grep -qF -- "$1" "$work/out"; }
@@ -301,6 +304,102 @@ setup firmware
 rm -f "$work/etc/nova-charge-limit.conf"
 check "run: fails without a config" fails run run
 
+# --- charger firmware lag (seen on the Nova) ---------------------------------
+cc="$bat/constant_charge_current"
+# Polls a check for up to 3 seconds, so the tests don't race the service.
+wait_until() {
+    local i
+    for ((i = 0; i < 150; i++)); do
+        "$@" && return 0
+        sleep 0.02
+    done
+    return 1
+}
+# Keeps the firmware reporting $1 for $2 rounds of 20ms, like a firmware that
+# hasn't applied (or keeps undoing) the requested current.
+firmware_reports() {
+    local i
+    for ((i = 0; i < $2; i++)); do
+        echo "$1" >"$cc"
+        sleep 0.02
+    done
+}
+
+setup nova
+capacity 85
+interval=0.3 max_ticks=0 run run &
+pid=$!
+check "lag: the service asks for a pause" wait_until current_is 0
+echo 7200000 >"$cc"
+check "lag: ...and asks again while the firmware still reports the old value" wait_until current_is 0
+stop_service "$pid"
+check "lag: a pause the firmware hasn't applied yet is not an error" fails output_has "could not"
+check "lag: ...and causes no warning" fails output_has "still reports"
+check "lag: the pause is logged once" output_count "charging paused" 1
+
+setup nova
+capacity 85
+interval=0.2 max_ticks=0 run run &
+pid=$!
+wait_until current_is 0
+firmware_reports 7200000 60
+check "lag: keeps asking until the firmware applies it" wait_until output_has "the charger firmware now reports charging paused"
+stop_service "$pid"
+check "lag: warns once when the firmware keeps reporting the old value" output_count "the charger firmware still reports charging allowed after 3 checks" 1
+check "lag: the warning shows the raw value" output_has "(constant_charge_current reads 7200000)"
+
+setup nova
+capacity 60
+echo 7000000 >"$cc"
+run run
+check "lag: a current below the maximum counts as charging allowed" current_is 7000000
+check "lag: ...so nothing is requested" fails output_has "battery at 60%"
+check "lag: the state records it" state_has "firmware=allowed"
+
+setup nova
+capacity 74
+echo 0 >"$cc"
+interval=0.2 max_ticks=0 run run &
+pid=$!
+wait_until current_is "$max_current"
+echo 7000000 >"$cc"
+sleep 0.5
+stop_service "$pid"
+check "lag: resuming accepts a lower current from the firmware" current_is 7000000
+check "lag: resume logged once" output_count "charging resumed" 1
+check "lag: no resume warning" fails output_has "still reports"
+
+setup nova
+capacity 85
+chmod 444 "$cc"
+run run
+check "lag: a rejected write logs the kernel's reason" output_has "writing 0 to constant_charge_current failed: Permission denied"
+check "lag: ...and nothing is recorded as paused" state_has "charging=allowed"
+chmod 644 "$cc"
+
+setup nova
+capacity 77
+interval=0.2 max_ticks=0 run run &
+pid=$!
+wait_until state_has "charging=allowed"
+out_file="$work/out-sleep" run sleep
+check "sleep: pauses charging for sleep" grep -qF "charging paused for sleep" "$work/out-sleep"
+check "sleep: the pause for sleep leaves a note for the service" test -e "$work/fake/state.sleep-pause"
+check "sleep: the running service picks up the note" wait_until test ! -e "$work/fake/state.sleep-pause"
+sleep 0.5
+check "sleep: ...and keeps the pause instead of undoing it" current_is 0
+stop_service "$pid"
+check "sleep: the service didn't resume charging between the resume point and the limit" \
+    output_count "charging resumed" 0
+
+setup nova
+capacity 85
+interval=0.2 max_ticks=0 run run &
+pid=$!
+wait_until current_is 0
+stop_service "$pid"
+check "restore: stopping restores charging" current_is "$max_current"
+
 # --- set / off / apply (through the fake service) -------------------------
 setup firmware
 check "set: 85 on firmware" run set 85
@@ -342,6 +441,25 @@ setup firmware
 rm -f "$work/fake/installed"
 check "set: fails when the service is not installed" fails run set 80
 check "set: says to run install.sh" output_has "service is not installed; run install.sh"
+
+# The user's case: an updated git checkout, but the service still runs an older install.
+setup nova
+sed 's/^version=.*/version=1.2.0/' "$tool" >"$work/old-installed"
+chmod +x "$work/old-installed"
+service_tool="$work/old-installed"
+check "set: works when the service is older" run set 80
+check "set: warns that the service is older" output_has "warning: the service is running version 1.2.0"
+check "set: says how to update it" output_has "To update it, run: sudo bash ./install.sh"
+# Before 1.3.1 the service didn't report a version.
+# shellcheck disable=SC2016 # a literal $version in the sed pattern
+sed 's/^version=.*/version=1.2.0/; s/"version=\$version" //' "$tool" >"$work/old-installed"
+run set 80
+check "set: warns about a service from before versions were reported" output_has "the service is running an older version"
+unset service_tool
+
+setup nova
+check "set: no version warning when the service matches" run set 80
+check "set: ...really none" fails output_has "warning: the service is running"
 
 for bad in "54" "101" "abc" "-5" "1000" "80 80" "80 96" "80 49" "80 x"; do
     setup firmware
@@ -632,6 +750,15 @@ check "status: shows the config" output_has "Configured:  stop at 80%, resume be
 check "status: shows the battery" output_has "Battery:     82% (Charging)"
 check "status: shows the method" output_has "Service:     running; pauses charging at the limit"
 check "status: shows the charging state" output_has "Charging:    paused"
+check "status: flags a service older than this copy" output_has "Version:     the service runs an older version, this copy is"
+
+setup nova
+capacity 80
+printf 'pid=%s\nversion=%s\nmethod=current\ncharging=paused\nfirmware=allowed\n' "$$" \
+    "$(sed -n 's/^version=//p' "$tool")" >"$work/fake/state"
+run status
+check "status: shows the version when the service matches" output_has "Version:     $(sed -n 's/^version=//p' "$tool")"
+check "status: shows a pause the firmware hasn't applied" output_has "Charging:    paused (waiting for the charger firmware, which still reports allowed)"
 check "status: shows raw values" output_has "Raw:         end_threshold=0 start_threshold=0 charge_current=$max_current"
 
 setup firmware

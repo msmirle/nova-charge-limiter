@@ -25,6 +25,14 @@ whichever one works on your device:
    Below 75% it restores the full charge current. Armada added this control
    in its kernel patch `0903` for bypass charging.
 
+   The firmware applies a new charge current a little later. Read back
+   straight after a change, it still reports the old value (e.g. `7200000`
+   just after writing `0`). So the service remembers what it asked for and
+   asks again at each check until the firmware reports it. It only warns if
+   the firmware still disagrees after 3 checks (about 90 seconds). Any
+   non-zero current counts as "charging allowed", since the firmware may
+   report less than the maximum (e.g. `7000000` of `7200000`).
+
 If the service stops (shutdown, uninstall, `off`), it always turns charging
 back on, so the battery is never left unable to charge.
 
@@ -246,12 +254,19 @@ Deep sleep:  off
 Battery:     80% (Not charging) at /sys/class/power_supply/battery
 Service:     running; pauses charging at the limit (firmware ignores charge thresholds)
 Charging:    paused
+Version:     1.3.1
 Raw:         end_threshold=0 start_threshold=0 charge_current=0 charge_current_max=...
 ```
 
-Logs: `journalctl -u nova-charge-limit`. The service logs each pause and
-resume, and with deep sleep on, each switch to real sleep and what woke the
-Nova.
+Just after a change, `Charging:` can show for example
+`paused (waiting for the charger firmware, which still reports allowed)`.
+That clears within a check or two.
+
+Logs: `journalctl -u nova-charge-limit`. The service logs its version when
+it starts, each pause and resume, and with deep sleep on, each switch to
+real sleep and what woke the Nova. The pause before sleep is logged by
+`systemd-suspend.service`; to see both, run
+`journalctl -u nova-charge-limit -u systemd-suspend -b`.
 
 ## Notes
 
@@ -300,6 +315,23 @@ The current installer's first line of output names `/var/lib/nova-charge-limit/b
 This came from version 1.0.x, which only knew the firmware thresholds. The
 Nova's firmware ignores those. Update and reinstall as above; the current
 version pauses charging instead.
+
+**`could not pause charging (constant_charge_current reads back 7200000)`** or **`could not resume charging`**
+
+These came from versions 1.1.0 to 1.3.0, and they were usually false alarms:
+charging *was* paused or resumed, but the charger firmware reports the change
+a little later. Version 1.3.1 no longer treats that delay as a failure.
+Update and reinstall as above.
+
+**`ignoring unknown setting DEEP_SLEEP_AT_LIMIT`**, or `status` says
+**`the service runs an older version`**
+
+The settings file is newer than the installed service. That happens when
+you `git pull` and run `./nova-charge-limit` from the folder without
+reinstalling, because the service always runs the installed copy in
+`/var/lib/nova-charge-limit/bin`. Run `sudo bash ./install.sh` in the
+updated folder. From 1.3.1 on, `set`, `off` and `deep-sleep` also warn
+about this.
 
 ## Uninstall
 

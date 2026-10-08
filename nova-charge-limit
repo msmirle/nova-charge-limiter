@@ -7,12 +7,20 @@
 # limit (constant_charge_current) as the battery level crosses the limit.
 set -uo pipefail
 
+version=1.3.1
 sys_root=${NOVA_CHARGE_LIMIT_SYS_ROOT:-/sys}
 config=${NOVA_CHARGE_LIMIT_CONFIG:-/etc/nova-charge-limit.conf}
 state_file=${NOVA_CHARGE_LIMIT_STATE:-/run/nova-charge-limit/state}
+# Left by "sleep" when it pauses charging, for the service to pick up.
+sleep_pause_file=$state_file.sleep-pause
+installed=/var/lib/nova-charge-limit/bin/nova-charge-limit
 interval=${NOVA_CHARGE_LIMIT_INTERVAL:-30}
 retry_delay=${NOVA_CHARGE_LIMIT_RETRY_DELAY:-2}
 service_wait=${NOVA_CHARGE_LIMIT_SERVICE_WAIT:-30}
+# How long one-shot commands wait for the charger firmware to apply a change.
+settle=${NOVA_CHARGE_LIMIT_SETTLE:-10}
+sleep_settle=${NOVA_CHARGE_LIMIT_SLEEP_SETTLE:-3}
+poll_delay=${NOVA_CHARGE_LIMIT_POLL_DELAY:-1}
 # Tests only: stop "run" after this many checks.
 max_ticks=${NOVA_CHARGE_LIMIT_MAX_TICKS:-0}
 sudo_bin=${NOVA_CHARGE_LIMIT_SUDO:-sudo}
@@ -41,6 +49,9 @@ exit_unsupported=3
 
 prog=${0##*/}
 battery='' method='' charging='' pause_capacity='' warned=0 sleep_pid=''
+# The charging state last asked of the firmware, and how many checks in a row
+# the firmware has reported something else.
+requested='' mismatch=0
 # Deep sleep bookkeeping for the current fake suspend.
 deep_blocked=0 deep_short=0 deep_failed=0 deep_announced=0
 
@@ -224,6 +235,11 @@ apply_thresholds() {
 }
 
 # --- Battery charge current limit (0 pauses charging, USB still powers the device)
+#
+# The charger firmware applies a new charge current on its own schedule. It
+# acknowledges the write straight away but reads back the previous value for
+# a while (on the Nova: 7200000 just after writing 0). So a change only counts
+# as failed if it still hasn't shown up after a few checks.
 
 current_max() {
     local max
@@ -237,16 +253,56 @@ current_max() {
 
 current_supported() { [[ -e $1/constant_charge_current ]] && current_max "$1" >/dev/null; }
 
-charging_paused() { [[ $(read_attr "$1/constant_charge_current") == 0 ]]; }
+# What the charger firmware currently reports: paused, allowed or unknown.
+# Any non-zero current counts as allowed; the firmware may report less than
+# constant_charge_current_max (e.g. 7000000 of 7200000).
+firmware_state() {
+    local current
 
-pause_charging() { write_attr "$1/constant_charge_current" 0 && charging_paused "$1"; }
+    current=$(read_attr "$1/constant_charge_current")
+    if ! is_uint "$current"; then
+        echo unknown
+    elif ((current == 0)); then
+        echo paused
+    else
+        echo allowed
+    fi
+}
 
-allow_charging() {
+firmware_paused() { [[ $(firmware_state "$1") == paused ]]; }
+
+# Logs the kernel's reason when the write itself fails.
+write_current() {
+    local err
+
+    if err=$({ printf '%s\n' "$2" >"$1/constant_charge_current"; } 2>&1); then
+        return 0
+    fi
+    log "writing $2 to constant_charge_current failed: ${err##*: }"
+    return 1
+}
+
+request() {
     local max
 
-    max=$(current_max "$1") || return 1
-    write_attr "$1/constant_charge_current" "$max" &&
-        [[ $(read_attr "$1/constant_charge_current") == "$max" ]]
+    if [[ $2 == paused ]]; then
+        write_current "$1" 0
+    else
+        max=$(current_max "$1") || return 1
+        write_current "$1" "$max"
+    fi
+}
+
+# For one-shot commands: request a state and wait up to $3 seconds for the
+# firmware to report it.
+request_and_wait() {
+    local battery=$1 want=$2 deadline=$((SECONDS + $3))
+
+    request "$battery" "$want" || return 2
+    until [[ $(firmware_state "$battery") == "$want" ]]; do
+        ((SECONDS < deadline)) || return 1
+        sleep "$poll_delay"
+    done
 }
 
 # --- Service -----------------------------------------------------------------
@@ -300,34 +356,59 @@ check_firmware() {
 }
 
 check_current() {
-    local capacity=$1 want
+    local capacity=$1 force_pause=${2-} want firmware
 
     if ! is_uint "$capacity"; then
         log "cannot read the battery level"
         return 0
     fi
-    if ((target_limit >= limit_max)); then
+    firmware=$(firmware_state "$battery")
+    # Before the first request, take over whatever the firmware is doing.
+    [[ -n $requested ]] || [[ $firmware == unknown ]] || requested=$firmware
+    # "nova-charge-limit sleep" paused charging while this service wasn't looking.
+    if [[ -e $sleep_pause_file ]]; then
+        rm -f "$sleep_pause_file"
+        requested=paused pause_capacity=$capacity warned=0
+    fi
+
+    if [[ -n $force_pause ]]; then
+        want=paused
+    elif ((target_limit >= limit_max)); then
         want=allowed
     elif ((capacity >= target_limit)); then
         want=paused
     elif ((capacity < target_resume)); then
         want=allowed
-    elif charging_paused "$battery"; then
+    elif [[ $requested == paused ]]; then
         want=paused
     else
         want=allowed
     fi
 
-    if [[ $want == paused ]]; then
-        if ! charging_paused "$battery"; then
-            if pause_charging "$battery"; then
-                log "battery at $capacity%: charging paused"
+    if [[ $want != "$requested" ]]; then
+        if request "$battery" "$want"; then
+            requested=$want mismatch=0
+            if [[ $want == paused ]]; then
+                log "battery at $capacity%: ${force_pause:-charging paused}"
                 pause_capacity=$capacity warned=0
             else
-                log "could not pause charging (constant_charge_current reads back" \
-                    "$(read_attr "$battery/constant_charge_current" || echo '?'))"
+                log "battery at $capacity%: charging resumed"
             fi
         fi
+    elif [[ $firmware != "$requested" ]]; then
+        # Not applied yet, or reset by the firmware (e.g. on plugging in).
+        if ((++mismatch == 3)); then
+            log "the charger firmware still reports charging $firmware after 3 checks" \
+                "(constant_charge_current reads $(read_attr "$battery/constant_charge_current" || echo '?'));" \
+                "asking for $requested again at every check"
+        fi
+        request "$battery" "$requested"
+    elif ((mismatch)); then
+        ((mismatch < 3)) || log "the charger firmware now reports charging $requested"
+        mismatch=0
+    fi
+
+    if [[ $requested == paused ]]; then
         [[ -n $pause_capacity ]] || pause_capacity=$capacity
         if ((!warned && capacity > pause_capacity + 1)); then
             log "warning: the battery rose from $pause_capacity% to $capacity% while charging" \
@@ -336,13 +417,6 @@ check_current() {
         fi
     else
         pause_capacity=''
-        if charging_paused "$battery"; then
-            if allow_charging "$battery"; then
-                log "battery at $capacity%: charging resumed"
-            else
-                log "could not resume charging"
-            fi
-        fi
     fi
 }
 
@@ -354,18 +428,16 @@ check() {
     if [[ $method == current ]]; then
         if deep_sleep_context && ! external_power_online; then
             # A charger plugged in during real sleep must not charge past the limit.
-            if ! charging_paused "$battery" && pause_charging "$battery"; then
-                log "charger unplugged during sleep: charging paused"
-            fi
+            check_current "$capacity" "charger unplugged during sleep: charging paused"
         else
             check_current "$capacity"
         fi
-        if charging_paused "$battery"; then charging=paused; else charging=allowed; fi
+        charging=${requested:-unknown}
     else
         charging=firmware
     fi
-    write_state "method=$method" "limit=$target_limit" "resume=$target_resume" \
-        "capacity=$capacity" "charging=$charging"
+    write_state "version=$version" "method=$method" "limit=$target_limit" "resume=$target_resume" \
+        "capacity=$capacity" "charging=$charging" "firmware=$(firmware_state "$battery")"
 }
 
 # --- Deep sleep at the limit (experimental, DEEP_SLEEP_AT_LIMIT=yes) ----------
@@ -402,7 +474,8 @@ deep_sleep_context() {
 
 deep_sleep_ready() {
     deep_sleep_context || return 1
-    charging_paused "$battery" || return 1
+    # Only once the firmware confirms the pause: real sleep can't watch the battery.
+    [[ $requested == paused ]] && firmware_paused "$battery" || return 1
     grep -qw s2idle "$sys_root/power/mem_sleep" 2>/dev/null
 }
 
@@ -476,9 +549,12 @@ deep_sleep() {
 
 # Never leave charging paused once nothing is watching the battery.
 restore_charging() {
-    if [[ $method == current ]] && charging_paused "$battery"; then
-        allow_charging "$battery" && log "charging allowed again"
-    fi
+    [[ $method == current ]] || return 0
+    [[ $requested == paused ]] || firmware_paused "$battery" || return 0
+    case $(request_and_wait "$battery" allowed "$settle"; echo $?) in
+        0) log "charging allowed again" ;;
+        1) log "asked the charger firmware to allow charging again; it hasn't confirmed yet" ;;
+    esac
 }
 
 on_signal() {
@@ -493,6 +569,7 @@ cmd_run() {
     load_config
     resolve_thresholds "$cfg_limit" "$cfg_resume"
     trap on_signal TERM INT
+    log "version $version started"
 
     # The battery only reports once the charger firmware is up, which can lag boot.
     while :; do
@@ -567,8 +644,16 @@ cmd_sleep() {
         fi
         return 0
     fi
-    charging_paused "$battery" && return 0
-    pause_charging "$battery" && log "battery at $capacity%: charging paused for sleep"
+    if [[ $(firmware_state "$battery") == paused ]]; then
+        touch "$sleep_pause_file" 2>/dev/null
+        return 0
+    fi
+    case $(request_and_wait "$battery" paused "$sleep_settle"; echo $?) in
+        0) log "battery at $capacity%: charging paused for sleep" ;;
+        1) log "battery at $capacity%: asked to pause charging for sleep; the charger firmware hasn't confirmed yet" ;;
+        *) return 0 ;;
+    esac
+    touch "$sleep_pause_file" 2>/dev/null
 }
 
 cmd_reset() {
@@ -578,14 +663,28 @@ cmd_reset() {
         [[ ! -e $battery/charge_control_start_threshold ]] ||
             write_attr "$battery/charge_control_start_threshold" "$resume_max"
     fi
-    if current_supported "$battery" && charging_paused "$battery"; then
-        allow_charging "$battery" || die "could not resume charging"
+    if current_supported "$battery" && [[ $(firmware_state "$battery") != allowed ]]; then
+        case $(request_and_wait "$battery" allowed "$settle"; echo $?) in
+            1) log "asked the charger firmware to resume charging; it hasn't confirmed yet" ;;
+            2) die "could not resume charging" ;;
+        esac
     fi
     log "limit lifted; the battery charges to 100%"
 }
 
 service_installed() {
     command -v "$systemctl_bin" >/dev/null && "$systemctl_bin" cat "$service" >/dev/null 2>&1
+}
+
+charging_description() {
+    local charging firmware
+
+    charging=$(read_state charging) firmware=$(read_state firmware)
+    if [[ $charging == paused || $charging == allowed ]] && [[ -n $firmware && $firmware != "$charging" ]]; then
+        echo "$charging (waiting for the charger firmware, which still reports $firmware)"
+    else
+        echo "$charging"
+    fi
 }
 
 report() {
@@ -598,8 +697,19 @@ report() {
         echo "Charging stops at $limit% and resumes below $resume%; the charger firmware enforces it."
     else
         echo "Charging pauses at $limit% and resumes below $resume%; the service watches the battery."
-        echo "Battery is at $capacity%: charging $(read_state charging)."
+        echo "Battery is at $capacity%: charging $(charging_description)."
     fi
+}
+
+# The service always runs the installed copy, which can differ from this one
+# (e.g. ./nova-charge-limit run from an updated git checkout).
+check_service_version() {
+    local running
+
+    running=$(read_state version)
+    [[ $running == "$version" ]] && return 0
+    log "warning: the service is running ${running:+version $running}${running:-an older version}" \
+        "from $installed, not version $version. To update it, run: sudo bash ./install.sh"
 }
 
 # Restart the service with the saved settings and wait for its first check.
@@ -613,6 +723,7 @@ activate() {
         pid=$("$systemctl_bin" show -p MainPID --value "$service" 2>/dev/null)
         if [[ -n $pid && $pid != 0 && $(read_state pid) == "$pid" && -n $(read_state charging) ]]; then
             report
+            check_service_version
             return 0
         fi
         if ! "$systemctl_bin" is-active --quiet "$service"; then
@@ -662,7 +773,7 @@ cmd_deep_sleep() {
 }
 
 cmd_status() {
-    local model capacity state pid end start current max
+    local model capacity state pid end start current max running
 
     model=$(read_attr "$sys_root/firmware/devicetree/base/model")
     echo "Device:      ${model:-unknown}"
@@ -689,11 +800,19 @@ cmd_status() {
         case $(read_state method) in
             firmware) echo "Service:     running; the charger firmware enforces the limit" ;;
             current) echo "Service:     running; pauses charging at the limit (firmware ignores charge thresholds)"
-                echo "Charging:    $(read_state charging)" ;;
+                echo "Charging:    $(charging_description)" ;;
             *) echo "Service:     starting" ;;
         esac
+        running=$(read_state version)
+        if [[ $running == "$version" ]]; then
+            echo "Version:     $version"
+        else
+            echo "Version:     the service runs ${running:-an older version}, this copy is $version" \
+                "(update the service with: sudo bash ./install.sh)"
+        fi
     else
         echo "Service:     not running (start it with: nova-charge-limit apply)"
+        echo "Version:     $version"
     fi
 
     end=$(read_attr "$battery/charge_control_end_threshold") start=$(read_attr "$battery/charge_control_start_threshold")
