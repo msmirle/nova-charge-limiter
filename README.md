@@ -254,7 +254,7 @@ Deep sleep:  off
 Battery:     80% (Not charging) at /sys/class/power_supply/battery
 Service:     running; pauses charging at the limit (firmware ignores charge thresholds)
 Charging:    paused
-Version:     1.3.1
+Version:     1.3.2
 Raw:         end_threshold=0 start_threshold=0 charge_current=0 charge_current_max=...
 ```
 
@@ -328,10 +328,22 @@ Update and reinstall as above.
 
 The settings file is newer than the installed service. That happens when
 you `git pull` and run `./nova-charge-limit` from the folder without
-reinstalling, because the service always runs the installed copy in
-`/var/lib/nova-charge-limit/bin`. Run `sudo bash ./install.sh` in the
-updated folder. From 1.3.1 on, `set`, `off` and `deep-sleep` also warn
-about this.
+reinstalling, or when the installer stopped early (see below). The service
+always runs the installed copy in `/var/lib/nova-charge-limit/bin`. Run
+`sudo bash ./install.sh` in the updated folder. From 1.3.1 on, `set`, `off`
+and `deep-sleep` also warn about this.
+
+**`Failed to enable unit: Unit nova-charge-limit-sleep.service does not exist`**
+
+A bug in the installers of versions 1.2.0 to 1.3.1. They removed the old
+sleep unit from 1.1.0 but then still tried to enable it. The installer
+stopped at that point, before restarting the service, so the old version
+kept running. Version 1.3.2 fixes this. Get the latest copy and run the
+installer again; it also cleans up what the failed install left behind:
+
+```bash
+cd nova-charge-limiter && git pull && sudo bash ./install.sh
+```
 
 ## Uninstall
 

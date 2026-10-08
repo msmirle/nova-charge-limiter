@@ -7,7 +7,7 @@
 # limit (constant_charge_current) as the battery level crosses the limit.
 set -uo pipefail
 
-version=1.3.1
+version=1.3.2
 sys_root=${NOVA_CHARGE_LIMIT_SYS_ROOT:-/sys}
 config=${NOVA_CHARGE_LIMIT_CONFIG:-/etc/nova-charge-limit.conf}
 state_file=${NOVA_CHARGE_LIMIT_STATE:-/run/nova-charge-limit/state}

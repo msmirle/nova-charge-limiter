@@ -51,6 +51,18 @@ case $1 in
         ;;
     show) cat "$FAKE_DIR/pid" ;;
     is-active) [[ $(<"$FAKE_DIR/service.exit") == 0 ]] ;;
+    enable | disable)
+        # Like the real one: a missing unit fails the whole call, doing nothing.
+        verb=$1
+        shift
+        [[ ${1-} == --now ]] && shift
+        for unit; do
+            if [[ ! -e ${FAKE_UNIT_DIR:-/nonexistent}/$unit ]]; then
+                echo "Failed to $verb unit: Unit $unit does not exist" >&2
+                exit 1
+            fi
+        done
+        ;;
 esac
 EOF
 # shellcheck disable=SC2016 # expanded by the fake journalctl
@@ -817,7 +829,7 @@ check "install: drop-in and tool agree on the sleep config path" grep -q "^Envir
 check "install: removes the 1.0.x udev rule" test ! -e "$stage/etc/udev/rules.d/90-nova-charge-limit.rules"
 check "install: removes the 1.1.0 sleep unit" test ! -e "$stage/etc/systemd/system/nova-charge-limit-sleep.service"
 check "install: PATH snippet installed" cmp -s "$repo/nova-charge-limit-path.sh" "$stage/etc/profile.d/nova-charge-limit.sh"
-# shellcheck disable=SC1091
+# shellcheck disable=SC1091,SC2030 # PATH is meant to change only in the subshell
 check "install: PATH snippet adds the bin dir once" test "$(PATH=/usr/bin; . "$stage/etc/profile.d/nova-charge-limit.sh"; . "$stage/etc/profile.d/nova-charge-limit.sh"; echo "$PATH")" = /usr/bin:/var/lib/nova-charge-limit/bin
 check "install: config installed" cmp -s "$repo/nova-charge-limit.conf" "$stage/etc/nova-charge-limit.conf"
 echo 'CHARGE_LIMIT=90' >"$stage/etc/nova-charge-limit.conf"
@@ -840,6 +852,71 @@ check "install: fails on an unwritable destination" fails staged install.sh
 # shellcheck disable=SC2016 # expanded by the inner bash
 check "install: names the unwritable path" bash -c 'DESTDIR="$1" bash "$2/install.sh" 2>&1 | grep -qF "cannot write $1/etc/systemd/system/nova-charge-limit.service"' _ "$stage" "$repo"
 chmod 755 "$stage/etc"
+
+# --- install / uninstall with systemctl (fake) -------------------------------
+# The full install, including the systemctl steps a staged install skips.
+# The fake systemctl fails on missing units like the real one.
+stage="$work/live"
+units="$stage/etc/systemd/system"
+live() {
+    # shellcheck disable=SC2031 # PATH is unchanged here; only a test subshell changed it
+    PATH="$work/bin:$PATH" FAKE_DIR="$work/fake" FAKE_TOOL="$tool" FAKE_UNIT_DIR="$units" \
+        DESTDIR="$stage" NOVA_CHARGE_LIMIT_TEST_LIVE=1 \
+        NOVA_CHARGE_LIMIT_SYS_ROOT="$work/sys" \
+        NOVA_CHARGE_LIMIT_CONFIG="$stage/etc/nova-charge-limit.conf" \
+        NOVA_CHARGE_LIMIT_STATE="$work/fake/state" \
+        NOVA_CHARGE_LIMIT_INTERVAL=0 NOVA_CHARGE_LIMIT_RETRY_DELAY=0 \
+        NOVA_CHARGE_LIMIT_SERVICE_WAIT=2 NOVA_CHARGE_LIMIT_SETTLE=1 \
+        NOVA_CHARGE_LIMIT_POLL_DELAY=0.05 NOVA_CHARGE_LIMIT_ALLOW_NONROOT=1 \
+        bash "$repo/$1" "${@:2}" >"$work/out" 2>&1
+}
+systemctl_called() { grep -qx -- "$1" "$work/fake/systemctl.log"; }
+never_called() { ! grep -qF -- "$1" "$work/fake/systemctl.log"; }
+
+setup nova
+rm -rf "$stage"
+check "live install: a fresh install succeeds" live install.sh
+check "live install: enables only the units it ships" systemctl_called "enable nova-charge-limit.service"
+check "live install: never touches the old sleep unit" never_called "nova-charge-limit-sleep"
+check "live install: starts the service" systemctl_called "restart nova-charge-limit.service"
+check "live install: ends with the status" output_has "Version:     $(sed -n 's/^version=//p' "$tool")"
+check "live install: no systemctl errors" fails output_has "Failed to"
+
+# Upgrading from 1.1.0, which had a separate sleep unit.
+setup nova
+rm -rf "$stage"
+mkdir -p "$units/sleep.target.wants" "$stage/etc/udev/rules.d"
+touch "$units/nova-charge-limit.service" "$units/nova-charge-limit-sleep.service" \
+    "$stage/etc/udev/rules.d/90-nova-charge-limit.rules"
+ln -s ../nova-charge-limit-sleep.service "$units/sleep.target.wants/nova-charge-limit-sleep.service"
+cp "$repo/nova-charge-limit.conf" "$stage/etc/nova-charge-limit.conf"
+check "live upgrade from 1.1.0: succeeds" live install.sh
+check "live upgrade from 1.1.0: stops the old service first" systemctl_called "disable --now nova-charge-limit.service"
+check "live upgrade from 1.1.0: disables the old sleep unit on its own" systemctl_called "disable nova-charge-limit-sleep.service"
+check "live upgrade from 1.1.0: removes the old sleep unit" test ! -e "$units/nova-charge-limit-sleep.service"
+check "live upgrade from 1.1.0: removes its link" test ! -L "$units/sleep.target.wants/nova-charge-limit-sleep.service"
+check "live upgrade from 1.1.0: enables only the new unit" systemctl_called "enable nova-charge-limit.service"
+check "live upgrade from 1.1.0: no systemctl errors" fails output_has "Failed to"
+
+# The state a failed 1.2.0-1.3.1 install left behind: the old sleep unit is
+# gone but its link remains.
+setup nova
+rm -rf "$stage"
+mkdir -p "$units/sleep.target.wants"
+touch "$units/nova-charge-limit.service"
+ln -s ../nova-charge-limit-sleep.service "$units/sleep.target.wants/nova-charge-limit-sleep.service"
+cp "$repo/nova-charge-limit.conf" "$stage/etc/nova-charge-limit.conf"
+check "live reinstall after a failed install: succeeds" live install.sh
+check "live reinstall after a failed install: removes the dangling link" \
+    test ! -L "$units/sleep.target.wants/nova-charge-limit-sleep.service"
+check "live reinstall after a failed install: no systemctl errors" fails output_has "Failed to"
+check "live reinstall after a failed install: the service runs" systemctl_called "restart nova-charge-limit.service"
+
+check "live uninstall: succeeds" live uninstall.sh
+check "live uninstall: stops and disables the service" systemctl_called "disable --now nova-charge-limit.service"
+check "live uninstall: lifts the limit" output_has "limit lifted"
+check "live uninstall: no systemctl errors" fails output_has "Failed to"
+check "live uninstall: nothing left" test -z "$(find "$stage" -type f -o -type l)"
 
 echo
 if ((failures)); then
