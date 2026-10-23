@@ -101,9 +101,66 @@ Safety limits:
   lights, power-button handling). Fake suspend has already turned those off.
 
 It's experimental because it hasn't been tried on a Nova yet. If waking up
-ever takes more than one power-button press, or the screen stays off, turn
+ever takes more than one power-button press, the screen stays off, or audio
+becomes unusable after waking, turn
 it off with `nova-charge-limit deep-sleep off` and open an issue with the
-output of `journalctl -u nova-charge-limit -b`.
+output of `journalctl -u nova-charge-limit -b`. A direct kernel sleep does
+not follow the complete systemd sleep lifecycle; audio recovery through
+that transition has not been verified on hardware.
+
+### Audio after resume
+
+There are two different failure modes:
+
+- **Muted but otherwise working:** Armada's fake suspend mutes its default
+  audio output, then tries to unmute it once after thawing apps. That
+  command's errors are discarded. If WirePlumber or the output is not ready,
+  audio can stay muted. The limiter now saves the output's mute state
+  before suspend and checks it after Armada has finished resuming. It
+  retries up to five times, restores deliberate mute as well as unmute,
+  and leaves a newly selected output alone. It does not change volume or
+  restart audio services automatically.
+- **Volume/mute controls don't work, or the output disappears:** this can
+  mean PipeWire/WirePlumber is stuck, the audio device did not return, or the
+  Qualcomm DSP/driver failed to restore its streams. Retrying unmute does
+  not fix those failures. Armada has had similar reports in
+  [armada-os/armada#31](https://github.com/armada-os/armada/issues/31).
+  Its [AudioReach suspend patch](https://github.com/armada-os/armada/blob/393ba6a387695e73f726859085854ea2cd4083f2/packages/kernel/patches/0530-ASoC-qdsp6-release-AudioReach-graphs-across-system-suspend.patch)
+  explicitly tears down and rebuilds DSP streams around real sleep.
+  These are possible causes, not a confirmed diagnosis of your device.
+
+For an immediate recovery attempt, run this in Konsole **without sudo**:
+
+```bash
+nova-charge-limit audio-recover
+```
+
+This restarts only your user's `pipewire`, `pipewire-pulse` and
+`wireplumber` services, then checks that an output responds. It interrupts
+active audio streams; some games may need restarting. It preserves mute
+and volume settings. A responsive output does not prove the speakers/DSP
+are working: test playback afterwards. If you want to unmute that output:
+
+```bash
+wpctl set-mute @DEFAULT_AUDIO_SINK@ 0
+```
+
+If recovery fails, a reboot may be needed for a stuck kernel/DSP device.
+Do not unload audio drivers or change mixer/codec registers blindly.
+Before rebooting, capture a report:
+
+```bash
+nova-charge-limit audio-diagnose > nova-audio-diagnostic.txt 2>&1
+```
+
+The report includes limiter/version state, available audio devices, service
+status, and recent audio, suspend and kernel logs. It is read-only and
+does not restart anything. Some logs may require additional permissions;
+the report records each command's exit status. Review it before sharing.
+If deep sleep at the limit is enabled, turn it off and repeat the same
+plugged-in sleep test. If the failure only happens with it enabled, leave
+it off and include that detail with the report. This isolates the
+experimental transition; it does not rule out an Armada audio bug.
 
 ### Install locations
 
@@ -235,9 +292,12 @@ nova-charge-limit set 90 70       # stop at 90%, resume below 70%
 nova-charge-limit off             # charge to 100% again
 nova-charge-limit deep-sleep on   # experimental: real sleep once the limit is reached
 nova-charge-limit deep-sleep off
+nova-charge-limit audio-recover   # restart your audio services if they are stuck
+nova-charge-limit audio-diagnose  # read-only report; review before sharing
 ```
 
-Every command except `status` asks for your password through `sudo` itself.
+The audio commands run as your logged-in user, without sudo. Other commands
+except `status` ask for your password through `sudo` themselves.
 Don't type `sudo` in front: `sudo` only searches the read-only system
 folders, so it reports `command not found`.
 
@@ -254,7 +314,7 @@ Deep sleep:  off
 Battery:     80% (Not charging) at /sys/class/power_supply/battery
 Service:     running; pauses charging at the limit (firmware ignores charge thresholds)
 Charging:    paused
-Version:     1.3.2
+Version:     1.3.3
 Raw:         end_threshold=0 start_threshold=0 charge_current=0 charge_current_max=...
 ```
 
@@ -358,6 +418,7 @@ thresholds, and removes every installed file, including the suspend drop-in.
 
 ```bash
 bash tests/nova-charge-limit-test.sh   # fake sysfs and systemd, no device needed
+bash tests/nova-charge-limit-audio-test.sh  # fake user session and audio server
 ```
 
 Keep line endings LF (`.gitattributes` enforces this); CRLF breaks the

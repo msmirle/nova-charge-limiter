@@ -18,6 +18,7 @@ files=(
     "$destdir/etc/udev/rules.d/90-nova-charge-limit.rules"
     "$destdir/etc/profile.d/nova-charge-limit.sh"
     "$destdir/run/nova-charge-limit-sleep.conf"
+    "$destdir/run/nova-charge-limit-audio.state"
 )
 
 if ((live)); then

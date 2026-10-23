@@ -7,7 +7,7 @@
 # limit (constant_charge_current) as the battery level crosses the limit.
 set -uo pipefail
 
-version=1.3.2
+version=1.3.3
 sys_root=${NOVA_CHARGE_LIMIT_SYS_ROOT:-/sys}
 config=${NOVA_CHARGE_LIMIT_CONFIG:-/etc/nova-charge-limit.conf}
 state_file=${NOVA_CHARGE_LIMIT_STATE:-/run/nova-charge-limit/state}
@@ -69,12 +69,14 @@ Commands:
   off                 Charge to 100% again (same as: set 100)
   deep-sleep on|off   Experimental: switch from fake suspend to real sleep once
                       the battery reaches the limit while sleeping on the charger
+  audio-recover       Restart your audio services (interrupts active audio streams)
+  audio-diagnose      Collect audio and sleep diagnostics; review before sharing
   apply               Re-apply the limit saved in $config
   reset               Lift any limit right now, without changing the saved one
   run                 Enforce the limit continuously (used by the service)
   sleep               Prepare for system sleep (run by systemd-suspend.service)
 
-All commands except status need root and ask for your password through sudo.
+Audio commands must run without sudo. Other commands except status need root.
 EOF
 }
 
@@ -825,6 +827,13 @@ case ${1-} in
     status)
         (($# == 1)) || { usage >&2; exit 2; }
         cmd_status
+        ;;
+    audio-recover | audio-diagnose)
+        (($# == 1)) || { usage >&2; exit 2; }
+        if [[ $1 == audio-diagnose ]]; then
+            cmd_status
+        fi
+        exec /usr/bin/bash "$(dirname "$(readlink -f -- "$0")")/nova-charge-limit-audio" "${1#audio-}"
         ;;
     run | sleep | reset | apply | off)
         (($# == 1)) || { usage >&2; exit 2; }
