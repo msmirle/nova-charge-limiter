@@ -821,13 +821,10 @@ touch "$stage/etc/udev/rules.d/90-nova-charge-limit.rules" "$stage/etc/systemd/s
 check "install: stages into DESTDIR" staged install.sh
 check "install: nothing under read-only /usr" test ! -e "$stage/usr"
 check "install: binary is executable" test -x "$stage/var/lib/nova-charge-limit/bin/nova-charge-limit"
-check "install: audio helper installed" cmp -s "$repo/nova-charge-limit-audio" "$stage/var/lib/nova-charge-limit/bin/nova-charge-limit-audio"
 check "install: unit installed" cmp -s "$repo/nova-charge-limit.service" "$stage/etc/systemd/system/nova-charge-limit.service"
 check "install: suspend drop-in installed" cmp -s "$repo/nova-charge-limit-suspend.conf" "$stage/etc/systemd/system/systemd-suspend.service.d/50-nova-charge-limit.conf"
 check "install: unit runs the installed binary" grep -q '^ExecStart=/usr/bin/bash /var/lib/nova-charge-limit/bin/nova-charge-limit run$' "$stage/etc/systemd/system/nova-charge-limit.service"
 check "install: drop-in runs the installed binary" grep -q '^ExecStartPre=-/usr/bin/bash /var/lib/nova-charge-limit/bin/nova-charge-limit sleep$' "$stage/etc/systemd/system/systemd-suspend.service.d/50-nova-charge-limit.conf"
-check "install: captures audio before Armada suspends" grep -q '^ExecStartPre=-/usr/bin/bash /var/lib/nova-charge-limit/bin/nova-charge-limit-audio save$' "$stage/etc/systemd/system/systemd-suspend.service.d/50-nova-charge-limit.conf"
-check "install: recovers audio after Armada finishes resuming" grep -q '^ExecStopPost=-/usr/bin/bash /var/lib/nova-charge-limit/bin/nova-charge-limit-audio restore$' "$stage/etc/systemd/system/systemd-suspend.service.d/50-nova-charge-limit.conf"
 check "install: drop-in and tool agree on the sleep config path" grep -q "^Environment=ARMADA_SLEEP_CONFIG=$(sed -n 's/^sleep_config=.*:-\(.*\)}$/\1/p' "$tool")$" "$stage/etc/systemd/system/systemd-suspend.service.d/50-nova-charge-limit.conf"
 check "install: removes the 1.0.x udev rule" test ! -e "$stage/etc/udev/rules.d/90-nova-charge-limit.rules"
 check "install: removes the 1.1.0 sleep unit" test ! -e "$stage/etc/systemd/system/nova-charge-limit-sleep.service"

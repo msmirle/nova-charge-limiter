@@ -75,7 +75,6 @@ if ((live)); then
 fi
 
 put 755 "$src/nova-charge-limit" "$bin"
-put 755 "$src/nova-charge-limit-audio" "$bin_dir/nova-charge-limit-audio"
 put 644 "$src/nova-charge-limit.service" "$unit"
 put 644 "$src/nova-charge-limit-suspend.conf" "$suspend_dropin"
 put 644 "$src/nova-charge-limit-path.sh" "$profile"
