@@ -7,7 +7,7 @@
 # limit (constant_charge_current) as the battery level crosses the limit.
 set -uo pipefail
 
-version=1.3.2
+version=1.4.0-rc.1
 sys_root=${NOVA_CHARGE_LIMIT_SYS_ROOT:-/sys}
 config=${NOVA_CHARGE_LIMIT_CONFIG:-/etc/nova-charge-limit.conf}
 state_file=${NOVA_CHARGE_LIMIT_STATE:-/run/nova-charge-limit/state}
@@ -30,13 +30,11 @@ journalctl_bin=${NOVA_CHARGE_LIMIT_JOURNALCTL:-journalctl}
 # instead (see nova-charge-limit-suspend.conf).
 armada_sleep_config=${NOVA_CHARGE_LIMIT_ARMADA_SLEEP_CONFIG:-/etc/armada/sleep.conf}
 sleep_config=${NOVA_CHARGE_LIMIT_SLEEP_CONFIG:-/run/nova-charge-limit-sleep.conf}
-# Armada's fake-suspend state; proc_root is only overridden by tests.
+# Armada's fake-suspend state.
 armada_run=${NOVA_CHARGE_LIMIT_ARMADA_RUN:-/run/armada}
-proc_root=${NOVA_CHARGE_LIMIT_PROC_ROOT:-/proc}
-# After a power-button wake, how long fake suspend gets to wake up by itself.
-wake_settle=${NOVA_CHARGE_LIMIT_WAKE_SETTLE:-3}
-# Real sleeps shorter than this count toward giving up on deep sleep.
-short_sleep=${NOVA_CHARGE_LIMIT_SHORT_SLEEP:-30}
+handoff_file=$state_file.handoff
+handoff_wait=${NOVA_CHARGE_LIMIT_HANDOFF_WAIT:-30}
+handoff_poll=${NOVA_CHARGE_LIMIT_HANDOFF_POLL:-0.2}
 service=nova-charge-limit.service
 sleep_marker='# nova-charge-limit: charging toward the limit'
 
@@ -53,7 +51,7 @@ battery='' method='' charging='' pause_capacity='' warned=0 sleep_pid=''
 # the firmware has reported something else.
 requested='' mismatch=0
 # Deep sleep bookkeeping for the current fake suspend.
-deep_blocked=0 deep_short=0 deep_failed=0 deep_announced=0
+deep_blocked=0
 
 log() { echo "$prog: $*" >&2; }
 die() { log "$*"; exit 1; }
@@ -73,6 +71,7 @@ Commands:
   reset               Lift any limit right now, without changing the saved one
   run                 Enforce the limit continuously (used by the service)
   sleep               Prepare for system sleep (run by systemd-suspend.service)
+  sleep-finished      Mark the end of a managed sleep cycle (used by systemd)
 
 All commands except status need root and ask for your password through sudo.
 EOF
@@ -444,11 +443,23 @@ check() {
 #
 # While the Nova sleeps on the charger, it stays in Armada's fake suspend so
 # this service can stop charging at the limit. Once charging is paused, real
-# sleep is safe and saves power, so enter it from inside the fake suspend:
-# the screen, input and apps stay off, and the power button wakes the kernel
-# and then fake suspend as usual.
+# sleep saves power. First finish fake suspend, including Armada's resume
+# work, then request a new systemd sleep cycle. Never nest a raw kernel
+# suspend inside the still-running fake-suspend service.
 
 fake_suspend_active() { [[ -e $armada_run/fake-suspend.active ]]; }
+
+configured_for_fake_sleep() {
+    local line mode=s2idle
+
+    [[ -r $armada_sleep_config ]] || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        if [[ $line =~ ^[[:space:]]*suspend_mode[[:space:]]*=[[:space:]]*(fake|s2idle)[[:space:]]*$ ]]; then
+            mode=${BASH_REMATCH[1]}
+        fi
+    done <"$armada_sleep_config"
+    [[ $mode == fake ]]
+}
 
 # Only for a fake suspend that "nova-charge-limit sleep" chose, never for one
 # the user set up in /etc/armada/sleep.conf or that started some other way.
@@ -466,85 +477,116 @@ deep_sleep_context() {
     ((target_limit < limit_max)) || return 1
     if ! fake_suspend_active; then
         # A new fake suspend starts with a clean slate.
-        deep_blocked=0 deep_short=0 deep_failed=0 deep_announced=0
+        deep_blocked=0
         return 1
     fi
-    ((!deep_blocked)) && fake_suspend_is_ours
+    fake_suspend_is_ours
 }
 
 deep_sleep_ready() {
     deep_sleep_context || return 1
+    ((!deep_blocked)) || return 1
+    configured_for_fake_sleep && return 1
     # Only once the firmware confirms the pause: real sleep can't watch the battery.
     [[ $requested == paused ]] && firmware_paused "$battery" || return 1
     grep -qw s2idle "$sys_root/power/mem_sleep" 2>/dev/null
 }
 
-# Prints "IRQ NAME" for what ended the last sleep, or "unknown".
-wake_reason() {
-    local irq name
+handoff_phase() {
+    local owner phase
 
-    irq=$(read_attr "$sys_root/power/pm_wakeup_irq")
-    if ! is_uint "$irq"; then
-        echo unknown
-        return 0
-    fi
-    name=$(awk -v irq="$irq:" '$1 == irq { print $NF; exit }' "$proc_root/interrupts" 2>/dev/null)
-    echo "$irq ${name:-unknown}"
+    [[ -r $handoff_file ]] || return 0
+    read -r owner phase <"$handoff_file" || return 0
+    [[ $owner == "$(read_state pid)" && -d /proc/$owner ]] || return 0
+    printf '%s' "$phase"
 }
 
-# The power button (or anything unrecognised) means the user wants to wake up.
-user_wake() { [[ ${1,,} =~ (pwrkey|resin|power|key|lid|hall|unknown) ]]; }
+write_handoff() {
+    local phase=$1 owner=${2:-$$} tmp="$handoff_file.$BASHPID"
+
+    if printf '%s %s\n' "$owner" "$phase" >"$tmp" && mv -f -- "$tmp" "$handoff_file"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    log "could not record the managed sleep handoff"
+    return 1
+}
+
+sleep_cycle_finished() {
+    local unit state
+
+    fake_suspend_active && return 1
+    for unit in systemd-suspend.service suspend.target sleep.target; do
+        state=$("$systemctl_bin" show -p ActiveState --value "$unit") || return 1
+        [[ $state == inactive ]] || return 1
+    done
+}
 
 deep_sleep() {
-    local capacity started slept reason
+    local deadline token current_token error phase polls=0
 
-    capacity=$(read_attr "$battery/capacity")
-    ((deep_announced++)) ||
-        log "battery at $capacity% with charging paused: switching from fake suspend to real sleep"
-    if ! write_attr "$sys_root/power/mem_sleep" s2idle; then
-        log "cannot select s2idle sleep; staying in fake suspend"
-        deep_blocked=1
+    deep_blocked=1
+    # Do not compete with an already requested wake.
+    [[ ! -e $armada_run/fake-suspend.wake ]] || return 0
+    token=$(stat -c '%i:%y' -- "$armada_run/fake-suspend.active") || return 0
+    log "charging paused: finishing fake suspend before requesting managed real sleep"
+    if ! (set -o noclobber; : >"$armada_run/fake-suspend.wake") 2>/dev/null; then
+        log "could not request the end of fake suspend; not entering real sleep"
         return 0
     fi
-    started=$SECONDS
-    # Blocks until the system wakes up again.
-    if ! write_attr "$sys_root/power/state" mem; then
-        if ((++deep_failed >= 3)); then
-            log "could not enter real sleep 3 times; staying in fake suspend"
-            deep_blocked=1
-        else
-            log "could not enter real sleep; trying again"
-            sleep "$retry_delay"
-        fi
-        return 0
-    fi
-    deep_failed=0
-    slept=$((SECONDS - started))
-    reason=$(wake_reason)
-
-    if user_wake "$reason"; then
-        log "woke from real sleep after ${slept}s (wake: $reason); leaving it to fake suspend to wake up"
-        deep_blocked=1
-        sleep "$wake_settle"
-        # Fake suspend normally sees the same power button press. If it
-        # didn't, ask it to wake up so the screen doesn't stay off.
-        if fake_suspend_active && touch "$armada_run/fake-suspend.wake" 2>/dev/null; then
-            log "fake suspend was still active; asked it to wake up"
-        fi
-        return 0
-    fi
-
-    if ((slept < short_sleep)); then
-        if ((++deep_short >= 5)); then
-            log "woke from real sleep 5 times in a row within ${short_sleep}s (last wake: $reason);" \
-                "staying in fake suspend"
-            deep_blocked=1
+    deadline=$((SECONDS + handoff_wait))
+    until sleep_cycle_finished; do
+        current_token=$(stat -c '%i:%y' -- "$armada_run/fake-suspend.active" 2>/dev/null) || current_token=''
+        if [[ -n $current_token && $current_token != "$token" ]]; then
+            log "a new fake suspend started during the handoff; cancelling real sleep"
             return 0
         fi
-    else
-        deep_short=0
+        if ((SECONDS >= deadline)); then
+            log "fake suspend did not finish cleanly; not entering real sleep"
+            return 0
+        fi
+        sleep "$handoff_poll"
+    done
+    # A power-policy daemon failure must not be hidden by another suspend.
+    if ! "$systemctl_bin" is-active --quiet armada-powerd.service; then
+        log "armada-powerd is not running after fake suspend; cancelling real sleep"
+        return 0
     fi
-    log "woke from real sleep after ${slept}s (wake: $reason); going back to sleep"
+    if ! firmware_paused "$battery"; then
+        log "the firmware no longer confirms charging is paused; cancelling real sleep"
+        return 0
+    fi
+    write_handoff requested || return 0
+    log "fake suspend finished; requesting real sleep through systemd"
+    if ! error=$("$systemctl_bin" --no-block suspend 2>&1); then
+        rm -f -- "$handoff_file"
+        log "systemd refused managed real sleep: $error"
+        return 0
+    fi
+    while :; do
+        phase=$(handoff_phase)
+        case $phase in
+            finished)
+                rm -f -- "$handoff_file"
+                log "managed real sleep cycle finished; returning to awake charging rules"
+                return 0
+                ;;
+            requested | started) ;;
+            *)
+                rm -f -- "$handoff_file"
+                log "managed real sleep was cancelled; leaving the device awake"
+                return 0
+                ;;
+        esac
+        # Count awake polls rather than wall time: SECONDS can jump over
+        # hours spent asleep before systemd gets to its post-sleep hook.
+        if ((polls++ >= handoff_wait * 5)); then
+            rm -f -- "$handoff_file"
+            log "managed sleep did not complete its lifecycle in time; not requesting another sleep"
+            return 0
+        fi
+        sleep "$handoff_poll"
+    done
 }
 
 # Never leave charging paused once nothing is watching the battery.
@@ -559,6 +601,7 @@ restore_charging() {
 
 on_signal() {
     [[ -z $sleep_pid ]] || kill "$sleep_pid" 2>/dev/null
+    rm -f -- "$handoff_file"
     restore_charging
     exit 0
 }
@@ -569,6 +612,7 @@ cmd_run() {
     load_config
     resolve_thresholds "$cfg_limit" "$cfg_resume"
     trap on_signal TERM INT
+    rm -f -- "$handoff_file"
     log "version $version started"
 
     # The battery only reports once the charger firmware is up, which can lag boot.
@@ -589,7 +633,7 @@ cmd_run() {
         fi
         if deep_sleep_ready; then
             deep_sleep
-            # Re-check straight away: the charger may have changed while asleep.
+            # Re-check after the managed cycle or a cancelled handoff.
             continue
         fi
         sleep "$interval" &
@@ -621,8 +665,12 @@ write_sleep_config() {
 # point, sleep in Armada's fake suspend instead (screen and input off, the
 # service keeps running); otherwise pause charging before sleeping.
 cmd_sleep() {
-    local capacity
+    local capacity managed=''
 
+    [[ $(handoff_phase) != requested ]] || managed=yes
+    # A handoff is one-shot. A failed pre-sleep check must not affect a later
+    # manual suspend.
+    [[ -z $managed ]] || write_handoff cancelled "$(read_state pid)"
     write_sleep_config
     if [[ $(read_state method) != current ]] || ! service_running; then
         return 0
@@ -634,9 +682,22 @@ cmd_sleep() {
     capacity=$(read_attr "$battery/capacity")
     is_uint "$capacity" || return 0
 
+    if [[ -n $managed ]]; then
+        if [[ $cfg_deep != yes ]] || configured_for_fake_sleep || ! firmware_paused "$battery" ||
+            ! grep -qw s2idle "$sys_root/power/mem_sleep"; then
+            log "managed sleep preconditions changed; keeping the configured sleep mode"
+            return 0
+        fi
+        write_sleep_config s2idle || return 1
+        write_handoff started "$(read_state pid)" || return 1
+        touch "$sleep_pause_file" || return 1
+        log "managed handoff: charging pause confirmed; selecting normal s2idle"
+        return 0
+    fi
+
     if external_power_online && ((capacity < target_resume)); then
         write_sleep_config fake
-        if [[ $cfg_deep == yes ]]; then
+        if [[ $cfg_deep == yes ]] && ! configured_for_fake_sleep; then
             log "battery at $capacity% and charging: sleeping in fake suspend until charging stops at" \
                 "$target_limit%, then switching to real sleep"
         else
@@ -654,6 +715,16 @@ cmd_sleep() {
         *) return 0 ;;
     esac
     touch "$sleep_pause_file" 2>/dev/null
+}
+
+cmd_sleep_finished() {
+    [[ $(handoff_phase) == started ]] || return 0
+    if [[ ${SERVICE_RESULT:-success} == success ]]; then
+        write_handoff finished "$(read_state pid)"
+    else
+        write_handoff failed "$(read_state pid)"
+        log "managed sleep service failed: $SERVICE_RESULT"
+    fi
 }
 
 cmd_reset() {
@@ -826,12 +897,13 @@ case ${1-} in
         (($# == 1)) || { usage >&2; exit 2; }
         cmd_status
         ;;
-    run | sleep | reset | apply | off)
+    run | sleep | sleep-finished | reset | apply | off)
         (($# == 1)) || { usage >&2; exit 2; }
         require_root "$@"
         case $1 in
             run) cmd_run ;;
             sleep) cmd_sleep ;;
+            sleep-finished) cmd_sleep_finished ;;
             reset) cmd_reset ;;
             apply) cmd_apply ;;
             off) cmd_set "$limit_max" ;;

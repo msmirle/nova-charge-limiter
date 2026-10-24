@@ -61,49 +61,95 @@ for why fake suspend is needed and what the alternatives are.
 
 ### Deep sleep at the limit (experimental, off by default)
 
-Fake suspend uses more power than real sleep, and it keeps doing so after
-the battery reaches the limit. With deep sleep at the limit turned on, the
-Nova switches to real sleep once charging pauses:
+**The managed handoff in v1.4.0-rc.1 replaces the unsafe nested kernel sleep
+used by v1.3.2.** It is a prerelease for device testing, not a confirmed fix
+for every audio or kernel resume problem. v1.3.2 remains available as the
+previous stable release.
 
 ```bash
-nova-charge-limit deep-sleep on    # turn it on
-nova-charge-limit deep-sleep off   # back to plain fake suspend
+nova-charge-limit deep-sleep on
+nova-charge-limit deep-sleep off
 ```
 
-1. You put the Nova to sleep on the charger below 75%. It sleeps in fake
-   suspend and charges, as above.
-2. At 80% the service pauses charging. That pause holds through real sleep.
-3. The service then enters real sleep (`s2idle`) from inside the fake
-   suspend. The screen, input and your apps stay off.
-4. You press the power button. The Nova wakes from real sleep, and fake
-   suspend wakes the screen and apps as usual.
+With deep sleep enabled:
 
-After any other wake, the service decides what to do:
+1. Put the Nova to sleep on the charger below the resume point (75% by
+   default). It enters fake suspend and the limiter keeps watching charging.
+2. At the limit (80%), the limiter pauses charging and waits until the
+   firmware reports the pause.
+3. It asks Armada to **finish fake suspend normally**, including restoring
+   its power policy, thawing apps and restoring display/audio.
+4. It waits for `systemd-suspend.service`, `suspend.target` and
+   `sleep.target` to become inactive and checks that `armada-powerd` is
+   running and charging is still paused.
+5. It requests **one new suspend through systemd**, with a one-shot `s2idle`
+   override. Armada's normal suspend dispatcher, systemd sleep hooks and
+   user-session freeze/thaw now handle real sleep.
+6. When that cycle ends, it returns to ordinary awake charging rules.
+   It does not use wake-IRQ guesses to repeatedly put the Nova back to sleep.
 
-| What woke the Nova | What happens |
-| --- | --- |
-| Power button, or anything the service can't identify | It never goes back to real sleep for this sleep. If fake suspend hasn't woken up after 3 seconds, the service asks it to (`/run/armada/fake-suspend.wake`), so the screen doesn't stay off. |
-| Anything else, e.g. the charger being plugged in or unplugged | It checks the battery. If charging is paused, or the charger was unplugged (charging is then paused), it goes back to real sleep. If the charger is plugged in and the battery is below 75%, charging resumes and it stays in fake suspend until 80%. |
+**Trade-off:** the screen may briefly light up, a sound may play, or a game
+may briefly resume between the two sleep cycles. This is intentional: the
+old fake cycle must finish completely before normal real sleep begins.
 
-The wake reason comes from `/sys/power/pm_wakeup_irq` and
-`/proc/interrupts`. Anything named like `pwrkey`, `resin`, `power`, `key`,
-`lid` or `hall` counts as you waking it.
+If you unplug during the charging fake sleep, charging is paused and the
+same managed handoff can happen. When real sleep ends, charging resumes
+below the resume point, as it does after any ordinary wake. A charger
+connection may wake the device; it is not automatically re-suspended.
 
 Safety limits:
 
-- It only applies to a fake suspend that `nova-charge-limit` chose. If you
-  set `suspend_mode = fake` in `/etc/armada/sleep.conf` yourself, it leaves
-  that alone.
-- If the Nova wakes up 5 times in a row within 30 seconds of entering real
-  sleep, or real sleep fails 3 times, it gives up and stays in fake suspend
-  for the rest of that sleep.
-- The inner real sleep skips Armada's sleep hooks (wake logging, controller
-  lights, power-button handling). Fake suspend has already turned those off.
+- It only acts on a fake suspend the limiter chose. An explicit
+  `suspend_mode = fake` in your Armada settings is left alone.
+- It won't start a handoff if fake suspend already has a wake request.
+- A stuck fake resume, unavailable unit state, inactive power daemon or
+  unconfirmed charging pause prevents the real-sleep request.
+- If systemd refuses the request or the pre/post hooks do not complete,
+  the error is logged and the handoff is not retried automatically.
+- The handoff request is tied to the running limiter process and consumed
+  once. Restarting the limiter clears it.
+- No watchdog is disabled and no audio service is automatically restarted.
 
-It's experimental because it hasn't been tried on a Nova yet. If waking up
-ever takes more than one power-button press, or the screen stays off, turn
-it off with `nova-charge-limit deep-sleep off` and open an issue with the
-output of `journalctl -u nova-charge-limit -b`.
+The old path wrote directly to `/sys/power/state` from inside fake suspend.
+A captured long-sleep failure showed an `armada-powerd` watchdog abort,
+PipeWire killed with SIGKILL, and kernel RCU warnings on wake. This release
+removes that bypass. The watchdog abort is confirmed; the sender of
+PipeWire's SIGKILL and any underlying kernel timekeeping fault remain
+unconfirmed. An ordinary managed suspend may still expose an Armada bug.
+
+To test this candidate from an existing checkout:
+
+```bash
+git fetch origin --tags
+git switch --detach v1.4.0-rc.1
+sudo bash ./install.sh
+nova-charge-limit deep-sleep on
+```
+
+Existing limit/resume/deep-sleep settings are kept. To return to stable,
+switch to `main`, pull, and run the installer again. A detached release
+checkout cannot use `git pull` until you switch back to a branch.
+
+After testing, collect the following over SSH before rebooting if audio
+still fails:
+
+```bash
+{
+  date
+  /var/lib/nova-charge-limit/bin/nova-charge-limit status
+  timeout 8 wpctl status
+  timeout 8 wpctl get-volume @DEFAULT_AUDIO_SINK@
+  systemctl --no-pager status armada-powerd.service
+  journalctl --user -b --no-pager -n 150 -u pipewire -u pipewire-pulse -u wireplumber
+  sudo journalctl -b --no-pager -n 200 -u nova-charge-limit -u systemd-suspend -u armada-powerd
+  sudo journalctl -k -b --no-pager -n 200
+} > ~/nova-managed-sleep-diagnostic.txt 2>&1
+```
+
+For SSH, first set `XDG_RUNTIME_DIR=/run/user/$(id -u)` and
+`DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus` using `export`.
+Review the report before sharing. It may include usernames, device names
+and network details. Keep audio services intact until the failure is captured.
 
 ### Install locations
 
@@ -166,7 +212,7 @@ during the sleep, the battery drains faster.
 | Approach | Exact limit in sleep? | Downsides |
 | --- | --- | --- |
 | **Fake suspend** (what this project does) | Yes | More power used while asleep on the charger. Unplugging during that sleep drains the battery faster. |
-| **Fake suspend, then real sleep at the limit** (this project, [opt-in](#deep-sleep-at-the-limit-experimental-off-by-default)) | Yes | Only uses fake suspend while charging. Experimental: relies on the power button wake being recognised. |
+| **Fake suspend, then managed real sleep at the limit** (this project, [opt-in](#deep-sleep-at-the-limit-experimental-off-by-default)) | Software-enforced while charging; pause held in real sleep | Briefly resumes before starting a normal real-sleep cycle. Hardware verification is still needed. |
 | **Periodic wake-ups**: real sleep, with an RTC alarm waking the Nova every few minutes to check | Roughly; can overshoot by a few % between checks | Unverified that the Nova's RTC alarm can wake it from sleep. Each wake may briefly turn the screen and Steam back on. Not recommended. |
 | **Kernel change in Armada** | Yes, in real sleep | Closest to the Deck. Has to be accepted into Armada and shipped in an OS update. |
 
@@ -254,7 +300,7 @@ Deep sleep:  off
 Battery:     80% (Not charging) at /sys/class/power_supply/battery
 Service:     running; pauses charging at the limit (firmware ignores charge thresholds)
 Charging:    paused
-Version:     1.3.2
+Version:     1.4.0-rc.1
 Raw:         end_threshold=0 start_threshold=0 charge_current=0 charge_current_max=...
 ```
 
@@ -358,6 +404,7 @@ thresholds, and removes every installed file, including the suspend drop-in.
 
 ```bash
 bash tests/nova-charge-limit-test.sh   # fake sysfs and systemd, no device needed
+bash tests/managed-sleep-test.sh      # complete fake-to-managed sleep handoff
 ```
 
 Keep line endings LF (`.gitattributes` enforces this); CRLF breaks the

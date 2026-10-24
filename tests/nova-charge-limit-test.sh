@@ -126,12 +126,10 @@ run() {
         NOVA_CHARGE_LIMIT_ARMADA_SLEEP_CONFIG="$work/etc/armada-sleep.conf" \
         NOVA_CHARGE_LIMIT_SLEEP_CONFIG="$work/fake/sleep.conf" \
         NOVA_CHARGE_LIMIT_ARMADA_RUN="$work/fake/armada" \
-        NOVA_CHARGE_LIMIT_PROC_ROOT="$work/proc" \
-        NOVA_CHARGE_LIMIT_WAKE_SETTLE=0 \
+        NOVA_CHARGE_LIMIT_HANDOFF_WAIT=0 \
         NOVA_CHARGE_LIMIT_SETTLE=1 \
         NOVA_CHARGE_LIMIT_SLEEP_SETTLE=1 \
         NOVA_CHARGE_LIMIT_POLL_DELAY=0.05 \
-        NOVA_CHARGE_LIMIT_SHORT_SLEEP=${short_sleep:-30} \
         "${runner[@]}" "$tool" "$@" >"${out_file:-$work/out}" 2>&1
 }
 runner=()
@@ -162,8 +160,6 @@ deep_setup() {
     touch "$work/fake/armada/fake-suspend.active"
     capacity 80
 }
-wake_irq() { echo "$1" >"$work/sys/power/pm_wakeup_irq"; }
-slept_real() { [[ $(<"$work/sys/power/state") == mem && $(<"$work/sys/power/mem_sleep") == s2idle ]]; }
 not_slept_real() { [[ ! -s $work/sys/power/state ]]; }
 service_state() { printf 'pid=%s\nmethod=%s\n' "$$" "$1" >"$work/fake/state"; }
 # The suspend mode Armada's device-env would pick: the last suspend_mode line.
@@ -593,57 +589,18 @@ check "reset: resumes charging" current_is "$max_current"
 check "reset: keeps the saved limit" config_untouched
 
 # --- deep sleep at the limit -------------------------------------------------
-# Two checks: the first pauses charging at the limit, the second could sleep.
+# Full managed lifecycle tests are in managed-sleep-test.sh.
 max_ticks=2
 
 deep_setup
 check "sleep: mentions the switch to real sleep when deep sleep is on" output_has "then switching to real sleep"
 
 deep_setup
-wake_irq 42
 check "deep: runs" run run
 check "deep: pauses at the limit" current_is 0
-check "deep: enters real sleep (s2idle)" slept_real
-check "deep: announces the switch" output_has "battery at 80% with charging paused: switching from fake suspend to real sleep"
-check "deep: power button wake is a user wake" output_has "(wake: 42 pm8941_pwrkey); leaving it to fake suspend to wake up"
-check "deep: asks a stuck fake suspend to wake" test -e "$work/fake/armada/fake-suspend.wake"
-check "deep: logs the wake request" output_has "asked it to wake up"
-
-deep_setup
-wake_irq 42
-max_ticks=4 run run
-check "deep: never sleeps again after a power button wake" output_count "woke from real sleep" 1
-
-deep_setup
-rm -f "$work/sys/power/pm_wakeup_irq"
-max_ticks=4 run run
-check "deep: an unknown wake counts as a user wake" output_has "(wake: unknown); leaving it to fake suspend"
-check "deep: ...and never sleeps again" output_count "woke from real sleep" 1
-
-deep_setup
-wake_irq 99
-max_ticks=4 run run
-check "deep: an IRQ missing from /proc/interrupts counts as a user wake" output_has "(wake: 99 unknown); leaving it"
-
-deep_setup
-wake_irq 77
-short_sleep=0 max_ticks=4 run run
-check "deep: a background wake goes back to sleep" output_count "(wake: 77 glink-adsp); going back to sleep" 3
-check "deep: background wakes don't wake fake suspend" test ! -e "$work/fake/armada/fake-suspend.wake"
-
-deep_setup
-wake_irq 77
-max_ticks=10 run run
-check "deep: gives up after 5 short sleeps in a row" output_has "woke from real sleep 5 times in a row within 30s (last wake: 77 glink-adsp); staying in fake suspend"
-check "deep: ...after exactly 4 retries" output_count "going back to sleep" 4
-check "deep: charging stays paused after giving up" current_is 0
-
-deep_setup
-wake_irq 77
-chmod 444 "$work/sys/power/state"
-max_ticks=6 run run
-check "deep: gives up if real sleep can't be entered" output_has "could not enter real sleep 3 times; staying in fake suspend"
-check "deep: retries before giving up" output_count "could not enter real sleep; trying again" 2
+check "deep: asks fake suspend to finish" test -e "$work/fake/armada/fake-suspend.wake"
+check "deep: times out instead of nesting kernel sleep" output_has "fake suspend did not finish cleanly"
+check "deep: never writes the kernel sleep state" not_slept_real
 
 deep_setup
 echo 'deep' >"$work/sys/power/mem_sleep"
@@ -680,43 +637,12 @@ run run
 check "deep: ignores a stale sleep config" not_slept_real
 
 deep_setup
-wake_irq 77
-unplug
-capacity 60
-short_sleep=0 max_ticks=3 run run
-check "deep: unplugged during fake suspend pauses charging" current_is 0
-check "deep: logs the unplug" output_has "charger unplugged during sleep: charging paused"
-check "deep: ...and sleeps for real" slept_real
-check "deep: stays paused across background wakes" output_count "going back to sleep" 2
-
-deep_setup
-wake_irq 42
 unplug
 capacity 60
 run run
-check "deep: after a power button wake, the awake rules apply again" current_is "$max_current"
-
-deep_setup
-wake_irq 42
-interval=0.2 max_ticks=0 run run &
-pid=$!
-sleep 0.6
-rm -f "$work/fake/armada/fake-suspend.active" "$work/fake/armada/fake-suspend.wake"
-sleep 0.6
-capacity 69
-# The next sleep: the running service is what "sleep" looks for.
-run_sleep_out=$(PATH="$work/bin:$PATH" NOVA_CHARGE_LIMIT_SYS_ROOT="$work/sys" \
-    NOVA_CHARGE_LIMIT_CONFIG="$work/etc/nova-charge-limit.conf" NOVA_CHARGE_LIMIT_STATE="$work/fake/state" \
-    NOVA_CHARGE_LIMIT_ARMADA_SLEEP_CONFIG="$work/etc/armada-sleep.conf" \
-    NOVA_CHARGE_LIMIT_SLEEP_CONFIG="$work/fake/sleep.conf" NOVA_CHARGE_LIMIT_ALLOW_NONROOT=1 \
-    "$tool" sleep 2>&1)
-touch "$work/fake/armada/fake-suspend.active"
-capacity 80
-sleep 0.8
-stop_service "$pid"
-check "deep: a new fake suspend starts fresh" output_count "switching from fake suspend to real sleep" 2
-check "the next sleep chose fake suspend again" grep -qF "sleeping in fake suspend until" <<<"$run_sleep_out"
-unset run_sleep_out
+check "deep: unplugged during fake suspend pauses charging" current_is 0
+check "deep: logs the unplug" output_has "charger unplugged during sleep: charging paused"
+check "deep: unplugged handoff also never writes kernel sleep" not_slept_real
 
 setup nova
 echo 'DEEP_SLEEP_AT_LIMIT=maybe' >>"$work/etc/nova-charge-limit.conf"
@@ -825,6 +751,7 @@ check "install: unit installed" cmp -s "$repo/nova-charge-limit.service" "$stage
 check "install: suspend drop-in installed" cmp -s "$repo/nova-charge-limit-suspend.conf" "$stage/etc/systemd/system/systemd-suspend.service.d/50-nova-charge-limit.conf"
 check "install: unit runs the installed binary" grep -q '^ExecStart=/usr/bin/bash /var/lib/nova-charge-limit/bin/nova-charge-limit run$' "$stage/etc/systemd/system/nova-charge-limit.service"
 check "install: drop-in runs the installed binary" grep -q '^ExecStartPre=-/usr/bin/bash /var/lib/nova-charge-limit/bin/nova-charge-limit sleep$' "$stage/etc/systemd/system/systemd-suspend.service.d/50-nova-charge-limit.conf"
+check "install: drop-in reports managed sleep completion" grep -q '^ExecStopPost=-/usr/bin/bash /var/lib/nova-charge-limit/bin/nova-charge-limit sleep-finished$' "$stage/etc/systemd/system/systemd-suspend.service.d/50-nova-charge-limit.conf"
 check "install: drop-in and tool agree on the sleep config path" grep -q "^Environment=ARMADA_SLEEP_CONFIG=$(sed -n 's/^sleep_config=.*:-\(.*\)}$/\1/p' "$tool")$" "$stage/etc/systemd/system/systemd-suspend.service.d/50-nova-charge-limit.conf"
 check "install: removes the 1.0.x udev rule" test ! -e "$stage/etc/udev/rules.d/90-nova-charge-limit.rules"
 check "install: removes the 1.1.0 sleep unit" test ! -e "$stage/etc/systemd/system/nova-charge-limit-sleep.service"
