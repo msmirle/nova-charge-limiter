@@ -61,7 +61,7 @@ for why fake suspend is needed and what the alternatives are.
 
 ### Deep sleep at the limit (experimental, off by default)
 
-**The managed handoff in v1.4.0-rc.1 replaces the unsafe nested kernel sleep
+**The managed handoff in v1.4.0-rc.2 replaces the unsafe nested kernel sleep
 used by v1.3.2.** It is a prerelease for device testing, not a confirmed fix
 for every audio or kernel resume problem. v1.3.2 remains available as the
 previous stable release.
@@ -117,11 +117,23 @@ removes that bypass. The watchdog abort is confirmed; the sender of
 PipeWire's SIGKILL and any underlying kernel timekeeping fault remain
 unconfirmed. An ordinary managed suspend may still expose an Armada bug.
 
+Hardware testing has now confirmed charging to 80%, a managed real-sleep
+cycle, and working audio after wake on a Nova. However, the same capture
+still shows `armada-powerd` watchdog aborts after managed sleep. The audio
+improvement does not establish that the watchdog/resume issue is fixed.
+The release remains a candidate, not a completely clean resume result.
+
+One earlier cycle also logged cancellation even though real suspend ran:
+the limiter briefly saw the pre-sleep hook's intermediate state as a
+cancellation. rc.2 gives preparation its own waiting state and records a
+cancellation only if preparation actually fails. This fixes bookkeeping;
+it does not change watchdog policy or restart audio.
+
 To test this candidate from an existing checkout:
 
 ```bash
 git fetch origin --tags
-git switch --detach v1.4.0-rc.1
+git switch --detach v1.4.0-rc.2
 sudo bash ./install.sh
 nova-charge-limit deep-sleep on
 ```
@@ -300,7 +312,7 @@ Deep sleep:  off
 Battery:     80% (Not charging) at /sys/class/power_supply/battery
 Service:     running; pauses charging at the limit (firmware ignores charge thresholds)
 Charging:    paused
-Version:     1.4.0-rc.1
+Version:     1.4.0-rc.2
 Raw:         end_threshold=0 start_threshold=0 charge_current=0 charge_current_max=...
 ```
 

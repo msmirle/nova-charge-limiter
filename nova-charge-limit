@@ -7,7 +7,7 @@
 # limit (constant_charge_current) as the battery level crosses the limit.
 set -uo pipefail
 
-version=1.4.0-rc.1
+version=1.4.0-rc.2
 sys_root=${NOVA_CHARGE_LIMIT_SYS_ROOT:-/sys}
 config=${NOVA_CHARGE_LIMIT_CONFIG:-/etc/nova-charge-limit.conf}
 state_file=${NOVA_CHARGE_LIMIT_STATE:-/run/nova-charge-limit/state}
@@ -571,7 +571,7 @@ deep_sleep() {
                 log "managed real sleep cycle finished; returning to awake charging rules"
                 return 0
                 ;;
-            requested | started) ;;
+            requested | preparing | started) ;;
             *)
                 rm -f -- "$handoff_file"
                 log "managed real sleep was cancelled; leaving the device awake"
@@ -664,13 +664,22 @@ write_sleep_config() {
 # nothing could stop charging at the limit. While plugged in below the resume
 # point, sleep in Armada's fake suspend instead (screen and input off, the
 # service keeps running); otherwise pause charging before sleeping.
+cancel_preparing_handoff() {
+    if [[ $(handoff_phase) == preparing ]]; then
+        write_handoff cancelled "$(read_state pid)"
+    fi
+}
+
 cmd_sleep() {
     local capacity managed=''
 
-    [[ $(handoff_phase) != requested ]] || managed=yes
-    # A handoff is one-shot. A failed pre-sleep check must not affect a later
-    # manual suspend.
-    [[ -z $managed ]] || write_handoff cancelled "$(read_state pid)"
+    if [[ $(handoff_phase) == requested ]]; then
+        managed=yes
+        write_handoff preparing "$(read_state pid)" || return 1
+        # A failed pre-sleep check must not affect a later manual suspend.
+        # Do not expose cancellation while a valid preparation is in progress.
+        trap cancel_preparing_handoff EXIT
+    fi
     write_sleep_config
     if [[ $(read_state method) != current ]] || ! service_running; then
         return 0

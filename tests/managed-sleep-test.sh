@@ -133,8 +133,37 @@ run_with_fake() {
     run_service
     local result=$?
     wait "$fake_pid" || return 1
+    if [[ -e $CASE/async-request ]]; then
+        local i
+        for ((i = 0; i < 300; i++)); do
+            [[ ! -e $CASE/async-done ]] || break
+            sleep 0.01
+        done
+        [[ -e $CASE/async-done ]] || return 1
+    fi
     return "$result"
 }
+
+cat >"$work/bin/async-systemctl" <<'EOF'
+#!/bin/bash
+if [[ $1 == --no-block ]]; then
+    owner=$(sed -n 's/^pid=//p' "$NOVA_CHARGE_LIMIT_STATE")
+    # Hold the intermediate hook phase long enough for the daemon to see it.
+    printf '%s preparing\n' "$owner" >"$NOVA_CHARGE_LIMIT_STATE.handoff.async"
+    mv "$NOVA_CHARGE_LIMIT_STATE.handoff.async" "$NOVA_CHARGE_LIMIT_STATE.handoff"
+    touch "$CASE/async-request"
+    (
+        sleep 0.1
+        printf '%s requested\n' "$owner" >"$NOVA_CHARGE_LIMIT_STATE.handoff.async"
+        mv "$NOVA_CHARGE_LIMIT_STATE.handoff.async" "$NOVA_CHARGE_LIMIT_STATE.handoff"
+        "$FAKE_SYSTEMCTL" "$@"
+        touch "$CASE/async-done"
+    ) >"$CASE/async.log" 2>&1 </dev/null &
+    exit 0
+fi
+exec "$FAKE_SYSTEMCTL" "$@"
+EOF
+chmod +x "$work/bin/async-systemctl"
 
 setup
 check "handoff: completes" run_with_fake
@@ -146,6 +175,15 @@ check "handoff: never writes kernel sleep or changes mem_sleep directly" no_raw_
 check "handoff: consumes its one-shot request" test ! -e "$CASE/state.handoff"
 check "handoff: charge remains paused" test "$(<"$CASE/sys/class/power_supply/battery/constant_charge_current")" = 0
 check "handoff: no audio service or watchdog changes" fails grep -Eq 'pipewire|wireplumber|Watchdog|restart|stop ' "$CASE/commands"
+
+setup
+export NOVA_CHARGE_LIMIT_SYSTEMCTL="$work/bin/async-systemctl"
+export FAKE_SYSTEMCTL="$work/bin/systemctl"
+check "async handoff: completes when preparation is observed between phases" run_with_fake
+check "async handoff: reports completion" output_has "managed real sleep cycle finished"
+check "async handoff: does not falsely report cancellation" fails output_has "managed real sleep was cancelled"
+check "async handoff: still requests exactly one sleep" requested_once
+unset NOVA_CHARGE_LIMIT_SYSTEMCTL FAKE_SYSTEMCTL
 
 setup
 touch "$CASE/request-fails"
@@ -275,6 +313,23 @@ check "pre-sleep: ignores another process's stale request" \
 "$TOOL" sleep-finished >>"$CASE/out" 2>&1
 check "post-sleep: ignores another process's request" \
     test "$(<"$CASE/state.handoff")" = '999999999 requested'
+
+setup
+printf 'pid=%s\nmethod=current\n' "$$" >"$CASE/state"
+printf '%s requested\n' "$$" >"$CASE/state.handoff"
+sed -i 's/DEEP_SLEEP_AT_LIMIT=yes/DEEP_SLEEP_AT_LIMIT=no/' "$CASE/limit.conf"
+"$TOOL" sleep >"$CASE/out" 2>&1
+check "preparation: opt-out is cancelled only when the hook exits" \
+    test "$(<"$CASE/state.handoff")" = "$$ cancelled"
+
+setup
+printf 'pid=%s\nmethod=current\n' "$$" >"$CASE/state"
+printf '%s requested\n' "$$" >"$CASE/state.handoff"
+echo 'CHARGE_LIMIT=not-a-percentage' >"$CASE/limit.conf"
+check "preparation: invalid configuration is reported as failure" \
+    fails "$TOOL" sleep
+check "preparation: configuration failure does not leave a preparing request" \
+    test "$(<"$CASE/state.handoff")" = "$$ cancelled"
 
 echo
 if ((failures)); then echo "$failures check(s) failed"; exit 1; fi
